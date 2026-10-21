@@ -1,0 +1,3 @@
+/target
+# Dev-only state dir (PROTONTUI_STATE_DIR); holds session tokens.
+/.dev-state

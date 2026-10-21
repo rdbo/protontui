@@ -1,0 +1,7 @@
+# Alpine's rustc links musl dynamically by default; protontui ships as one static binary.
+# An explicit build target keeps `crt-static` off build scripts and proc-macros, which can't be static.
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

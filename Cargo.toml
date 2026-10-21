@@ -1,0 +1,41 @@
+[package]
+name = "protontui"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal UI for Proton VPN: sign in, browse servers, connect the whole host over WireGuard"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+nix = { version = "0.31.3", features = ["user", "fs"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2"] }
+rpassword = "7.5.4"
+rtnetlink = "0.23.0"
+# local-agent-rs calls `TcpKeepalive::with_retries`, which needs socket2's `all` feature but does not
+# enable it (its own Cargo.lock hid that). Enabling it here fixes the build through feature unification.
+socket2 = { version = "0.5.10", features = ["all"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "io-std", "net", "process", "signal"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = "1.9.1"
+
+# Proton's own crates, used as path dependencies (see PLAN.md §1).
+proton-srp = { path = "../proton-crypto-rs/proton-srp" }
+local-agent-rs = { path = "../python-proton-vpn-local-agent/local_agent_rs" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
