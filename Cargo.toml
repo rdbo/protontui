@@ -36,6 +36,8 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = "1.9.1"
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+# Reads the certificate's start time when the local agent finds it not yet valid (clock skew).
+x509-parser = "0.16.0"
 
 # Proton's own crates, used as path dependencies (see PLAN.md §1).
 proton-srp = { path = "../proton-crypto-rs/proton-srp" }

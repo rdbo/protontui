@@ -8,12 +8,16 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use protontui::api::{self, ApiClient};
-use protontui::config::Paths;
+use protontui::config::{AutoConnect, KillSwitchMode, NetShield, Paths, Settings};
+use protontui::ipc::{
+    self, Client, ErrorKind, Event as IpcEvent, IpcError, LoginReply, Request as IpcRequest, Response,
+};
 use protontui::logging::{self, Role};
 use protontui::servers::select::{FeatureFilter, Intent, Request};
-use protontui::session::{self, Authenticator, LoginError, LoginOutcome, Session};
+use protontui::session::{self, AccountInfo, Authenticator, LoginError, LoginOutcome, Session};
 use protontui::vpn;
-use protontui::vpn::engine::{ConnectionState, Engine, Event, RuntimeState};
+use protontui::vpn::engine::{ConnectionState, Details, Engine, RuntimeState, ServerInfo};
+use protontui::vpn::killswitch;
 
 /// Proton VPN for the terminal: sign in, browse servers, and connect the whole host over WireGuard.
 #[derive(Parser)]
@@ -29,10 +33,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the privileged daemon that owns the network (as root).
+    /// Run the privileged daemon that owns the network (as root; normally started by the service manager).
     Daemon,
-    /// Connect to a server (as root). Until the daemon exists, this stays in the foreground: Ctrl-C or
-    /// `protontui disconnect` ends the connection.
+    /// Connect to a server. Through the daemon this returns once connected; with --standalone (as root) it
+    /// stays in the foreground until Ctrl-C or `protontui --standalone disconnect`.
     Connect {
         /// Fastest server in this country (ISO code, e.g. CH).
         #[arg(long)]
@@ -44,6 +48,8 @@ enum Command {
         #[arg(long, value_enum)]
         feature: Option<Feature>,
     },
+    /// Switch to another server (Free plan: a random free server, with a cooldown).
+    ChangeServer,
     /// Disconnect.
     Disconnect,
     /// Show the account and connection state.
@@ -56,8 +62,26 @@ enum Command {
     },
     /// Sign out and delete the session, keys and certificate.
     Logout,
+    /// Show the settings, or change one: `protontui config kill-switch standard`.
+    Config {
+        /// kill-switch, allow-lan, netshield, vpn-accelerator, moderate-nat, port-forwarding, ipv6,
+        /// custom-dns, auto-connect.
+        key: Option<String>,
+        value: Option<String>,
+    },
     /// Emergency cleanup (as root): remove the kill switch, tunnel, routes and DNS changes.
     Recover,
+    /// Print the nftables scripts the kill switch would apply (for `nft -c -f -` checks).
+    #[command(hide = true)]
+    KillSwitchRules {
+        #[arg(long)]
+        allow_lan: bool,
+        #[arg(long)]
+        ipv6: bool,
+        /// e.g. 185.159.157.1:51820
+        #[arg(long)]
+        endpoint: Option<std::net::SocketAddrV4>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -94,15 +118,34 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
+    let standalone = cli.standalone;
     match cli.command {
         None => not_yet("the TUI", "T5.1"),
-        Some(Command::Daemon) => not_yet("the daemon", "T4.2"),
-        Some(Command::Connect { country, server, feature }) => connect(country, server, feature).await,
+        Some(Command::Daemon) => {
+            protontui::daemon::run(Paths::detect()?).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Connect { country, server, feature }) => {
+            let request = connect_request(country, server, feature);
+            if standalone { standalone::connect(request).await } else { connect(request).await }
+        }
+        Some(Command::ChangeServer) if standalone => bail!("change-server needs the daemon"),
+        Some(Command::ChangeServer) => change_server().await,
+        Some(Command::Disconnect) if standalone => standalone::disconnect().await,
         Some(Command::Disconnect) => disconnect().await,
+        Some(Command::Status) if standalone => standalone::status().await,
         Some(Command::Status) => status().await,
+        Some(Command::Login { username }) if standalone => standalone::login(username).await,
         Some(Command::Login { username }) => login(username).await,
+        Some(Command::Logout) if standalone => standalone::logout().await,
         Some(Command::Logout) => logout().await,
+        Some(Command::Config { key, value }) => config(standalone, key, value).await,
         Some(Command::Recover) => recover().await,
+        Some(Command::KillSwitchRules { allow_lan, ipv6, endpoint }) => {
+            print!("{}", killswitch::ruleset(&killswitch::Rules { allow_lan, ipv6, endpoint, api: None }));
+            print!("{}", killswitch::ipv6_leak_ruleset());
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -111,16 +154,38 @@ fn not_yet(what: &str, task: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(2))
 }
 
-fn api_client() -> Result<ApiClient> {
-    Ok(ApiClient::new(api::DEFAULT_BASE_URL)?)
+fn connect_request(country: Option<String>, server: Option<String>, feature: Option<Feature>) -> Request {
+    let intent = match (country, server) {
+        (Some(code), _) => Intent::Country(code.to_ascii_uppercase()),
+        (None, Some(name)) => Intent::Server(name.to_ascii_uppercase()),
+        (None, None) => Intent::Fastest,
+    };
+    let mut request = Request::new(intent);
+    if let Some(feature) = feature {
+        request = request.with_feature(match feature {
+            Feature::P2p => FeatureFilter::P2P,
+            Feature::Tor => FeatureFilter::Tor,
+            Feature::Streaming => FeatureFilter::Streaming,
+        });
+    }
+    request
 }
 
-async fn login(username: Option<String>) -> Result<ExitCode> {
-    let paths = Paths::detect()?;
-    if let Some(existing) = Session::restore(api_client()?, &paths)? {
-        bail!("already signed in as {}; run `protontui logout` first", existing.username());
-    }
+async fn client() -> Result<Client> {
+    Client::connect(&ipc::socket_path()).await
+}
 
+// ---------------------------------------------------------------------------------------------------------
+// Through the daemon
+// ---------------------------------------------------------------------------------------------------------
+
+async fn login(username: Option<String>) -> Result<ExitCode> {
+    let client = client().await?;
+    if let Response::Status(status) = client.call(IpcRequest::Status).await?
+        && let Some(name) = status.username
+    {
+        bail!("already signed in as {name}; run `protontui logout` first");
+    }
     let username = match username {
         Some(u) => u,
         None => prompt("Username: ")?,
@@ -129,71 +194,70 @@ async fn login(username: Option<String>) -> Result<ExitCode> {
         bail!("no username given");
     }
     let password = read_password("Password: ")?;
-
-    let api = api_client()?;
-    let mut auth = Authenticator::new(api.clone());
-    let authenticated = match auth.login(&username, &password).await {
-        Ok(LoginOutcome::Done(done)) => done,
-        Ok(LoginOutcome::Need2Fa { .. }) => {
-            let mut attempt = 0;
-            loop {
-                attempt += 1;
-                let code = prompt("Two-factor code (authenticator app or recovery code): ")?;
-                match auth.submit_totp(&code).await {
-                    Ok(done) => break done,
-                    Err(LoginError::WrongTwoFactorCode) if attempt < 3 => eprintln!("Incorrect code, try again."),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        Err(e) => return Err(e.into()),
+    let mut reply = match client.call(IpcRequest::Login { username, password: password.to_string() }).await? {
+        Response::Login(reply) => reply,
+        other => bail!("unexpected answer from the daemon: {other:?}"),
     };
     drop(password);
-
-    let session = Session::start(api, &paths, authenticated)?;
-    tracing::info!("signed in as {}", session.username());
-    match session.refresh_account().await {
-        Ok(account) => println!(
-            "Signed in as {} · {} · tier {} ({})",
-            account.username,
-            account.plan(),
-            account.max_tier,
-            account.tier_name()
-        ),
-        Err(e) => {
-            tracing::warn!("fetching account info after login: {e:#}");
-            println!("Signed in as {} (account info unavailable: {e:#})", session.username());
+    let mut attempt = 0;
+    while let LoginReply::Need2Fa { .. } = reply {
+        attempt += 1;
+        let code = prompt("Two-factor code (authenticator app or recovery code): ")?;
+        match client.call(IpcRequest::Submit2Fa { code }).await {
+            Ok(Response::Login(next)) => reply = next,
+            Ok(other) => bail!("unexpected answer from the daemon: {other:?}"),
+            Err(e) if attempt < 3 && ipc_kind(&e) == Some(ErrorKind::WrongTwoFactorCode) => {
+                eprintln!("Incorrect code, try again.")
+            }
+            Err(e) => return Err(e),
         }
     }
-    println!("Session stored in {}", paths.session_file().display());
+    if let LoginReply::Done { account } = reply {
+        match account {
+            Some(account) => println!("Signed in as {}", account_line(&account)),
+            None => println!("Signed in (account info unavailable for now)."),
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
+fn ipc_kind(error: &anyhow::Error) -> Option<ErrorKind> {
+    error.downcast_ref::<IpcError>().map(|e| e.kind)
+}
+
+fn account_line(account: &AccountInfo) -> String {
+    format!("{} · {} · tier {} ({})", account.username, account.plan(), account.max_tier, account.tier_name())
+}
+
 async fn logout() -> Result<ExitCode> {
-    let paths = Paths::detect()?;
-    match Session::restore(api_client()?, &paths)? {
-        Some(session) => {
-            let name = session.username().to_owned();
-            session.logout().await?;
-            println!("Signed out {name}; session, keys and certificate deleted.");
-        }
-        None => {
-            // Nothing to revoke, but make sure nothing account-bound lingers.
-            session::wipe(&paths)?;
-            println!("Not signed in.");
-        }
-    }
+    client().await?.call(IpcRequest::Logout).await?;
+    println!("Signed out; session, keys and certificate deleted.");
     Ok(ExitCode::SUCCESS)
 }
 
 async fn status() -> Result<ExitCode> {
-    let paths = Paths::detect()?;
-    let Some(session) = Session::restore(api_client()?, &paths)? else {
-        println!("Not signed in. Run `protontui login`.");
-        println!("Connection:   {}", connection_summary());
-        return Ok(ExitCode::SUCCESS);
-    };
-    let account = session.account().await.context("fetching account info")?;
+    let client = client().await?;
+    let Response::Status(status) = client.call(IpcRequest::Status).await? else { bail!("unexpected answer") };
+    match client.call(IpcRequest::GetAccount).await {
+        Ok(Response::Account { account: Some(account) }) => print_account(&account),
+        Ok(_) if status.username.is_none() => println!("Not signed in. Run `protontui login`."),
+        Ok(_) => {}
+        Err(e) => println!("Account:      {} (details unavailable: {e:#})", status.username.unwrap_or_default()),
+    }
+    println!("Connection:   {}", describe_state(&status.state));
+    print_details(&status.details);
+    println!(
+        "Kill switch:  {}{}",
+        kill_switch_name(status.kill_switch),
+        if status.kill_switch_armed { " (blocking traffic outside the tunnel)" } else { "" }
+    );
+    if status.change_server_in > 0 {
+        println!("Change server: available in {}", format_duration(status.change_server_in));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_account(account: &AccountInfo) {
     let identity = match (&account.display_name, &account.email) {
         (_, Some(email)) => format!("{} <{email}>", account.username),
         (Some(name), None) => format!("{} ({name})", account.username),
@@ -209,31 +273,356 @@ async fn status() -> Result<ExitCode> {
     if account.delinquent {
         println!("Billing:      payment overdue; some servers may be unavailable");
     }
-    println!("Connection:   {}", connection_summary());
+}
+
+fn print_details(details: &Details) {
+    if let Some(location) = &details.location {
+        println!("Public IP:    {} ({}, {})", location.ip, location.country, location.isp);
+    }
+    if let Some(stats) = &details.stats {
+        println!(
+            "Traffic:      ↓ {}  ↑ {}  (handshake {})",
+            format_bytes(stats.rx_bytes),
+            format_bytes(stats.tx_bytes),
+            stats.handshake_age_secs.map_or("–".into(), |s| format!("{s}s ago"))
+        );
+    }
+    if let Some(port) = details.forwarded_port {
+        println!("Forwarded:    port {port} (TCP and UDP)");
+    }
+    if let Some(stats) = &details.netshield {
+        println!("NetShield:    blocked {} ads, {} trackers, {} malware", stats.ads, stats.trackers, stats.malware);
+    }
+}
+
+fn kill_switch_name(mode: KillSwitchMode) -> &'static str {
+    match mode {
+        KillSwitchMode::Off => "off",
+        KillSwitchMode::Standard => "standard",
+        KillSwitchMode::Permanent => "permanent",
+    }
+}
+
+fn server_place(server: &ServerInfo) -> String {
+    let country = protontui::servers::countries::country_name(&server.exit_country).unwrap_or(&server.exit_country);
+    let mut place = if server.city.is_empty() { country.to_owned() } else { format!("{}, {country}", server.city) };
+    if server.secure_core {
+        place.push_str(&format!(" via {}", server.entry_country));
+    }
+    place
+}
+
+fn describe_state(state: &ConnectionState) -> String {
+    match state {
+        ConnectionState::Disconnected => "disconnected".into(),
+        ConnectionState::Connecting { server: None } => "connecting".into(),
+        ConnectionState::Connecting { server: Some(s) } => {
+            format!("connecting to {} ({}:{})", s.name, s.entry_ip, s.port)
+        }
+        ConnectionState::Connected { server, since } => format!(
+            "connected to {} ({}) via {}:{} for {}",
+            server.name,
+            server_place(server),
+            server.entry_ip,
+            server.port,
+            format_duration(protontui::config::unix_now().saturating_sub(*since))
+        ),
+        ConnectionState::Reconnecting { server, reason } => format!("reconnecting to {} ({reason})", server.name),
+        ConnectionState::Disconnecting => "disconnecting".into(),
+        ConnectionState::Error { reason } => format!("error: {reason}"),
+    }
+}
+
+/// Prints one event the way both `connect` variants show progress. Returns `Some(exit code)` once the
+/// connection reached a final state.
+struct Progress {
+    live_line: bool,
+    stats_shown: bool,
+    /// Events of a previous connection's teardown come first; only states after `Connecting` count.
+    started: bool,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self { live_line: std::io::stderr().is_terminal(), stats_shown: false, started: false }
+    }
+
+    fn clear_line(&mut self) {
+        if std::mem::take(&mut self.stats_shown) {
+            eprint!("\r\x1b[2K");
+        }
+    }
+
+    /// `foreground`: the connection lives in this process (standalone), so stats are shown and `Connected`
+    /// isn't the end.
+    fn show(&mut self, event: IpcEvent, foreground: bool) -> Option<ExitCode> {
+        match event {
+            IpcEvent::StateChanged { state } => {
+                self.clear_line();
+                match &state {
+                    ConnectionState::Connecting { server: Some(s) } => {
+                        self.started = true;
+                        eprintln!("Connecting to {} ({}:{})…", s.name, s.entry_ip, s.port)
+                    }
+                    ConnectionState::Connecting { server: None } => {
+                        self.started = true;
+                        eprintln!("Preparing…")
+                    }
+                    ConnectionState::Connected { server, .. } => {
+                        println!(
+                            "Connected to {} ({}) via {}:{}.{}",
+                            server.name,
+                            server_place(server),
+                            server.entry_ip,
+                            server.port,
+                            if foreground {
+                                " Ctrl-C or `doas protontui --standalone disconnect` to disconnect."
+                            } else {
+                                ""
+                            }
+                        );
+                        if !foreground {
+                            return Some(ExitCode::SUCCESS);
+                        }
+                    }
+                    ConnectionState::Reconnecting { reason, .. } => eprintln!("Reconnecting: {reason}"),
+                    ConnectionState::Disconnecting if self.started => eprintln!("Restoring the network…"),
+                    ConnectionState::Disconnected if self.started => {
+                        println!("Disconnected.");
+                        return Some(if foreground { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+                    }
+                    ConnectionState::Error { reason } if self.started => {
+                        eprintln!("error: {reason}");
+                        return Some(ExitCode::FAILURE);
+                    }
+                    _ => {}
+                }
+            }
+            IpcEvent::Location { location } => {
+                self.clear_line();
+                println!("Public IP: {} ({}, {})", location.ip, location.country, location.isp);
+            }
+            IpcEvent::Warning { message } | IpcEvent::Error { message } => {
+                self.clear_line();
+                eprintln!("warning: {message}");
+            }
+            IpcEvent::Stats { stats } if foreground && self.live_line => {
+                eprint!(
+                    "\r\x1b[2K↓ {} ({}/s)  ↑ {} ({}/s)  handshake {}",
+                    format_bytes(stats.rx_bytes),
+                    format_bytes(stats.rx_rate),
+                    format_bytes(stats.tx_bytes),
+                    format_bytes(stats.tx_rate),
+                    stats.handshake_age_secs.map_or("–".into(), |s| format!("{s}s ago"))
+                );
+                self.stats_shown = true;
+            }
+            IpcEvent::PortForward { port } => {
+                self.clear_line();
+                match port {
+                    Some(port) => println!("Forwarded port: {port}"),
+                    None => println!("No forwarded port."),
+                }
+            }
+            IpcEvent::NetShieldStats { stats } => {
+                self.clear_line();
+                println!(
+                    "NetShield blocked: {} ads, {} trackers, {} malware",
+                    stats.ads, stats.trackers, stats.malware
+                );
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// How long `connect` waits for the daemon to finish connecting.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(180);
+
+async fn connect(request: Request) -> Result<ExitCode> {
+    let client = client().await?;
+    let mut events = client.events().context("event stream")?;
+    client.call(IpcRequest::Subscribe).await?;
+    client.call(IpcRequest::Connect(request)).await?;
+    follow_connection(&client, &mut events).await
+}
+
+async fn change_server() -> Result<ExitCode> {
+    let client = client().await?;
+    let mut events = client.events().context("event stream")?;
+    client.call(IpcRequest::Subscribe).await?;
+    client.call(IpcRequest::ChangeServer).await?;
+    follow_connection(&client, &mut events).await
+}
+
+/// Shows progress until connected or failed. Ctrl-C cancels the attempt.
+async fn follow_connection(
+    client: &Client,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<IpcEvent>,
+) -> Result<ExitCode> {
+    let mut progress = Progress::new();
+    let deadline = tokio::time::sleep(CONNECT_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                let event = event.context("the daemon closed the connection")?;
+                if let Some(code) = progress.show(event, false) {
+                    return Ok(code);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Cancelling…");
+                client.call(IpcRequest::Disconnect).await?;
+                return Ok(ExitCode::from(130));
+            }
+            _ = &mut deadline => {
+                bail!("still not connected after {}s; see `protontui status`", CONNECT_TIMEOUT.as_secs());
+            }
+        }
+    }
+}
+
+async fn disconnect() -> Result<ExitCode> {
+    client().await?.call(IpcRequest::Disconnect).await?;
+    println!("Disconnected.");
     Ok(ExitCode::SUCCESS)
 }
 
-/// The connection as the engine's state record describes it.
-fn connection_summary() -> String {
-    match RuntimeState::load() {
-        Ok(None) => "disconnected".into(),
-        Ok(Some(state)) if !state.owner_alive() => {
-            format!("left over from a crashed run (pid {}); run `doas protontui disconnect`", state.pid)
-        }
-        Ok(Some(state)) => match (&state.server, state.connected_since) {
-            (Some(server), Some(since)) => format!(
-                "connected to {} ({}{}) via {}:{} for {}",
-                server.name,
-                server.city,
-                if server.city.is_empty() { server.exit_country.clone() } else { format!(", {}", server.exit_country) },
-                server.entry_ip,
-                server.port,
-                format_duration(protontui::config::unix_now().saturating_sub(since))
-            ),
-            _ => format!("connecting (pid {})", state.pid),
+// ---------------------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------------------
+
+async fn config(standalone: bool, key: Option<String>, value: Option<String>) -> Result<ExitCode> {
+    let client = if standalone { None } else { Some(client().await?) };
+    let paths = Paths::detect()?;
+    let mut settings = match &client {
+        Some(client) => match client.call(IpcRequest::GetSettings).await? {
+            Response::Settings { settings } => settings,
+            other => bail!("unexpected answer from the daemon: {other:?}"),
         },
-        Err(e) => format!("unknown ({e:#})"),
+        None => Settings::load(&paths.settings_file())?,
+    };
+    let Some(key) = key else {
+        print!("{}", toml::to_string_pretty(&settings)?);
+        return Ok(ExitCode::SUCCESS);
+    };
+    let Some(value) = value else {
+        println!("{}", get_setting(&settings, &key)?);
+        return Ok(ExitCode::SUCCESS);
+    };
+    set_setting(&mut settings, &key, &value)?;
+    match &client {
+        Some(client) => {
+            client.call(IpcRequest::SetSettings { settings: settings.clone() }).await?;
+        }
+        None => settings.save(&paths.settings_file())?,
     }
+    println!("{key} = {}", get_setting(&settings, &key)?);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn get_setting(settings: &Settings, key: &str) -> Result<String> {
+    Ok(match key {
+        "kill-switch" => kill_switch_name(settings.kill_switch).into(),
+        "allow-lan" => settings.allow_lan.to_string(),
+        "netshield" => match settings.netshield {
+            None => "default".into(),
+            Some(level) => level.level().to_string(),
+        },
+        "vpn-accelerator" => settings.vpn_accelerator.to_string(),
+        "moderate-nat" => settings.moderate_nat.to_string(),
+        "port-forwarding" => settings.port_forwarding.to_string(),
+        "ipv6" => settings.ipv6.to_string(),
+        "custom-dns" if settings.custom_dns.enabled => {
+            settings.custom_dns.servers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        }
+        "custom-dns" => "off".into(),
+        "auto-connect" => match &settings.auto_connect {
+            AutoConnect::Off => "off".into(),
+            AutoConnect::Fastest => "fastest".into(),
+            AutoConnect::Last => "last".into(),
+            AutoConnect::Profile(name) => format!("profile:{name}"),
+        },
+        _ => bail!("unknown setting {key:?}"),
+    })
+}
+
+fn set_setting(settings: &mut Settings, key: &str, value: &str) -> Result<()> {
+    let flag = || -> Result<bool> {
+        match value {
+            "on" | "true" | "yes" | "1" => Ok(true),
+            "off" | "false" | "no" | "0" => Ok(false),
+            _ => bail!("{key} takes on/off"),
+        }
+    };
+    match key {
+        "kill-switch" => {
+            settings.kill_switch = match value {
+                "off" => KillSwitchMode::Off,
+                "standard" | "on" => KillSwitchMode::Standard,
+                "permanent" => KillSwitchMode::Permanent,
+                _ => bail!("kill-switch takes off, standard or permanent"),
+            }
+        }
+        "allow-lan" => settings.allow_lan = flag()?,
+        "netshield" => {
+            settings.netshield = match value {
+                "default" => None,
+                "0" | "off" => Some(NetShield::Off),
+                "1" | "malware" => Some(NetShield::Malware),
+                "2" | "ads" | "all" => Some(NetShield::AdsTrackersMalware),
+                _ => bail!("netshield takes 0, 1, 2 or default"),
+            }
+        }
+        "vpn-accelerator" => settings.vpn_accelerator = flag()?,
+        "moderate-nat" => settings.moderate_nat = flag()?,
+        "port-forwarding" => settings.port_forwarding = flag()?,
+        "ipv6" => settings.ipv6 = flag()?,
+        "custom-dns" if value == "off" => settings.custom_dns.enabled = false,
+        "custom-dns" => {
+            let servers = value
+                .split(',')
+                .map(|s| s.trim().parse().with_context(|| format!("{s:?} isn't an IP address")))
+                .collect::<Result<Vec<_>>>()?;
+            settings.custom_dns.enabled = true;
+            settings.custom_dns.servers = servers;
+        }
+        "auto-connect" => {
+            settings.auto_connect = match value {
+                "off" => AutoConnect::Off,
+                "fastest" => AutoConnect::Fastest,
+                "last" => AutoConnect::Last,
+                _ => bail!("auto-connect takes off, fastest or last"),
+            }
+        }
+        _ => bail!("unknown setting {key:?}"),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Local
+// ---------------------------------------------------------------------------------------------------------
+
+async fn recover() -> Result<ExitCode> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("recover needs root: run `doas protontui recover`");
+    }
+    let report = vpn::recover().await;
+    if report.actions.is_empty() && report.errors.is_empty() {
+        println!("Nothing to recover: no protontui firewall tables, interface, routes or DNS changes found.");
+    }
+    for action in &report.actions {
+        tracing::info!("recover: {action}");
+        println!("✓ {action}");
+    }
+    for error in &report.errors {
+        tracing::error!("recover: {error}");
+        eprintln!("✗ {error}");
+    }
+    Ok(if report.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 fn format_duration(secs: u64) -> String {
@@ -253,179 +642,6 @@ fn format_bytes(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
-}
-
-/// Runs a connection in the foreground until Ctrl-C, SIGTERM (`protontui disconnect`) or a fatal error.
-async fn connect(country: Option<String>, server: Option<String>, feature: Option<Feature>) -> Result<ExitCode> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    if !nix::unistd::geteuid().is_root() {
-        bail!("connecting changes the host network and needs root: run `doas protontui connect`");
-    }
-    let paths = Paths::detect()?;
-    let session = Session::restore(api_client()?, &paths)?.with_context(|| {
-        format!("not signed in (no session in {}); run `protontui login`", paths.state_dir.display())
-    })?;
-
-    let intent = match (country, server) {
-        (Some(code), _) => Intent::Country(code.to_ascii_uppercase()),
-        (None, Some(name)) => Intent::Server(name.to_ascii_uppercase()),
-        (None, None) => Intent::Fastest,
-    };
-    let mut request = Request::new(intent);
-    if let Some(feature) = feature {
-        request = request.with_feature(match feature {
-            Feature::P2p => FeatureFilter::P2P,
-            Feature::Tor => FeatureFilter::Tor,
-            Feature::Streaming => FeatureFilter::Streaming,
-        });
-    }
-
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let engine = Engine::start(Arc::new(session), paths).await?;
-    let mut events = engine.subscribe();
-    engine.connect(request).await?;
-
-    let live_line = std::io::stderr().is_terminal();
-    let mut stats_shown = false;
-    let clear_line = |shown: &mut bool| {
-        if std::mem::take(shown) {
-            eprint!("\r\x1b[2K");
-        }
-    };
-    loop {
-        tokio::select! {
-            _ = sigint.recv() => {
-                clear_line(&mut stats_shown);
-                eprintln!("Disconnecting…");
-                engine.disconnect().await?;
-            }
-            _ = sigterm.recv() => {
-                clear_line(&mut stats_shown);
-                engine.disconnect().await?;
-            }
-            event = events.recv() => match event {
-                Ok(Event::StateChanged(state)) => {
-                    clear_line(&mut stats_shown);
-                    match &state {
-                        ConnectionState::Connecting { server: Some(s) } => {
-                            eprintln!("Connecting to {} ({}:{})…", s.name, s.entry_ip, s.port)
-                        }
-                        ConnectionState::Connecting { server: None } => eprintln!("Preparing…"),
-                        ConnectionState::Connected { server, .. } => println!(
-                            "Connected to {} ({}{}) via {}:{}. Ctrl-C or `doas protontui disconnect` to disconnect.",
-                            server.name,
-                            server.city,
-                            if server.city.is_empty() { server.exit_country.clone() } else { format!(", {}", server.exit_country) },
-                            server.entry_ip,
-                            server.port
-                        ),
-                        ConnectionState::Reconnecting { reason, .. } => eprintln!("Reconnecting: {reason}"),
-                        ConnectionState::Disconnecting => eprintln!("Restoring the network…"),
-                        ConnectionState::Disconnected => {
-                            println!("Disconnected.");
-                            return Ok(ExitCode::SUCCESS);
-                        }
-                        ConnectionState::Error { reason } => {
-                            eprintln!("error: {reason}");
-                            return Ok(ExitCode::FAILURE);
-                        }
-                    }
-                }
-                Ok(Event::Location(location)) => {
-                    clear_line(&mut stats_shown);
-                    println!("Public IP: {} ({}, {})", location.ip, location.country, location.isp);
-                }
-                Ok(Event::Warning(warning)) => {
-                    clear_line(&mut stats_shown);
-                    eprintln!("warning: {warning}");
-                }
-                Ok(Event::Stats(stats)) if live_line => {
-                    eprint!(
-                        "\r\x1b[2K↓ {} ({}/s)  ↑ {} ({}/s)  handshake {}",
-                        format_bytes(stats.rx_bytes),
-                        format_bytes(stats.rx_rate),
-                        format_bytes(stats.tx_bytes),
-                        format_bytes(stats.tx_rate),
-                        stats.handshake_age_secs.map_or("–".into(), |s| format!("{s}s ago"))
-                    );
-                    stats_shown = true;
-                }
-                Ok(Event::Stats(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => bail!("the engine stopped"),
-            }
-        }
-    }
-}
-
-/// Ends the connection owned by a `protontui connect` process, or cleans up after one that crashed.
-async fn disconnect() -> Result<ExitCode> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-
-    let Some(state) = RuntimeState::load()? else {
-        println!("Not connected.");
-        return Ok(ExitCode::SUCCESS);
-    };
-    if !state.owner_alive() {
-        if !nix::unistd::geteuid().is_root() {
-            bail!("a crashed connection left changes behind; clean them up with `doas protontui disconnect`");
-        }
-        for action in vpn::engine::cleanup_stale().await? {
-            println!("✓ {action}");
-        }
-        println!("Disconnected (cleaned up after a crashed run).");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let pid = Pid::from_raw(state.pid as i32);
-    match kill(pid, Signal::SIGTERM) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::EPERM) => bail!("the connection belongs to root: run `doas protontui disconnect`"),
-        Err(e) => return Err(e).context("signalling the connection process"),
-    }
-    // Teardown takes a moment (DNS, routes, link); wait for the process to drop its record.
-    for _ in 0..100 {
-        if RuntimeState::load()?.is_none() || !process_running(state.pid) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    match RuntimeState::load()? {
-        None => {
-            println!("Disconnected.");
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(_) => bail!(
-            "the connection process (pid {}) didn't finish disconnecting; try `doas protontui recover`",
-            state.pid
-        ),
-    }
-}
-
-fn process_running(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-async fn recover() -> Result<ExitCode> {
-    if !nix::unistd::geteuid().is_root() {
-        bail!("recover needs root: run `doas protontui recover`");
-    }
-    let report = vpn::recover().await;
-    if report.actions.is_empty() && report.errors.is_empty() {
-        println!("Nothing to recover: no protontui firewall tables, interface, routes or DNS changes found.");
-    }
-    for action in &report.actions {
-        tracing::info!("recover: {action}");
-        println!("✓ {action}");
-    }
-    for error in &report.errors {
-        tracing::error!("recover: {error}");
-        eprintln!("✗ {error}");
-    }
-    Ok(if report.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 /// Reads one line from the terminal, falling back to stdin when there's no terminal.
@@ -449,4 +665,227 @@ fn read_password(label: &str) -> Result<Zeroizing<String>> {
         Err(e) => return Err(e).context("reading password"),
     };
     Ok(Zeroizing::new(password))
+}
+
+/// `--standalone`: the engine runs in this process (as root) and the session lives in this user's state
+/// directory. For development, and for hosts without the daemon.
+mod standalone {
+    use super::*;
+
+    fn api_client() -> Result<ApiClient> {
+        Ok(ApiClient::new(api::DEFAULT_BASE_URL)?)
+    }
+
+    pub async fn login(username: Option<String>) -> Result<ExitCode> {
+        let paths = Paths::detect()?;
+        if let Some(existing) = Session::restore(api_client()?, &paths)? {
+            bail!("already signed in as {}; run `protontui logout` first", existing.username());
+        }
+
+        let username = match username {
+            Some(u) => u,
+            None => prompt("Username: ")?,
+        };
+        if username.is_empty() {
+            bail!("no username given");
+        }
+        let password = read_password("Password: ")?;
+
+        let api = api_client()?;
+        let mut auth = Authenticator::new(api.clone());
+        let authenticated = match auth.login(&username, &password).await {
+            Ok(LoginOutcome::Done(done)) => done,
+            Ok(LoginOutcome::Need2Fa { .. }) => {
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    let code = prompt("Two-factor code (authenticator app or recovery code): ")?;
+                    match auth.submit_totp(&code).await {
+                        Ok(done) => break done,
+                        Err(LoginError::WrongTwoFactorCode) if attempt < 3 => eprintln!("Incorrect code, try again."),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
+        drop(password);
+
+        let session = Session::start(api, &paths, authenticated)?;
+        tracing::info!("signed in as {}", session.username());
+        match session.refresh_account().await {
+            Ok(account) => println!("Signed in as {}", account_line(&account)),
+            Err(e) => {
+                tracing::warn!("fetching account info after login: {e:#}");
+                println!("Signed in as {} (account info unavailable: {e:#})", session.username());
+            }
+        }
+        println!("Session stored in {}", paths.session_file().display());
+        Ok(ExitCode::SUCCESS)
+    }
+
+    pub async fn logout() -> Result<ExitCode> {
+        let paths = Paths::detect()?;
+        match Session::restore(api_client()?, &paths)? {
+            Some(session) => {
+                let name = session.username().to_owned();
+                session.logout().await?;
+                println!("Signed out {name}; session, keys and certificate deleted.");
+            }
+            None => {
+                // Nothing to revoke, but make sure nothing account-bound lingers.
+                session::wipe(&paths)?;
+                println!("Not signed in.");
+            }
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    pub async fn status() -> Result<ExitCode> {
+        let paths = Paths::detect()?;
+        let Some(session) = Session::restore(api_client()?, &paths)? else {
+            println!("Not signed in. Run `protontui --standalone login`.");
+            println!("Connection:   {}", connection_summary());
+            return Ok(ExitCode::SUCCESS);
+        };
+        let account = session.account().await.context("fetching account info")?;
+        print_account(&account);
+        println!("Connection:   {}", connection_summary());
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// The connection as the engine's state record describes it.
+    fn connection_summary() -> String {
+        match RuntimeState::load() {
+            Ok(None) => "disconnected".into(),
+            Ok(Some(state)) if !state.owner_alive() => {
+                format!(
+                    "left over from a crashed run (pid {}); run `doas protontui --standalone disconnect`",
+                    state.pid
+                )
+            }
+            Ok(Some(state)) => match (&state.server, state.connected_since) {
+                (Some(server), Some(since)) => format!(
+                    "connected to {} ({}) via {}:{} for {} (pid {})",
+                    server.name,
+                    server_place(server),
+                    server.entry_ip,
+                    server.port,
+                    format_duration(protontui::config::unix_now().saturating_sub(since)),
+                    state.pid
+                ),
+                _ => format!("connecting (pid {})", state.pid),
+            },
+            Err(e) => format!("unknown ({e:#})"),
+        }
+    }
+
+    /// Runs a connection in the foreground until Ctrl-C, SIGTERM (`protontui --standalone disconnect`) or a
+    /// fatal error.
+    pub async fn connect(request: Request) -> Result<ExitCode> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        if !nix::unistd::geteuid().is_root() {
+            bail!("connecting changes the host network and needs root: run `doas protontui --standalone connect`");
+        }
+        let paths = Paths::detect()?;
+        let session = Session::restore(api_client()?, &paths)?.with_context(|| {
+            format!("not signed in (no session in {}); run `protontui --standalone login`", paths.state_dir.display())
+        })?;
+
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let engine = Engine::start(Arc::new(session), paths.clone()).await?;
+        let mut events = engine.subscribe();
+        engine.connect(request).await?;
+
+        let mut progress = Progress::new();
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {
+                    progress.clear_line();
+                    eprintln!("Disconnecting…");
+                    engine.disconnect().await?;
+                }
+                _ = sigterm.recv() => {
+                    progress.clear_line();
+                    engine.disconnect().await?;
+                }
+                event = events.recv() => match event {
+                    Ok(event) => {
+                        let error = matches!(&event, protontui::vpn::engine::Event::StateChanged(ConnectionState::Error { .. }));
+                        if let Some(code) = progress.show(event.into(), true) {
+                            if error && Settings::load(&paths.settings_file())?.kill_switch == KillSwitchMode::Standard {
+                                eprintln!(
+                                    "The kill switch keeps blocking traffic outside the tunnel. \
+                                     `doas protontui --standalone disconnect` removes it."
+                                );
+                            }
+                            return Ok(code);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => bail!("the engine stopped"),
+                }
+            }
+        }
+    }
+
+    /// Ends the connection owned by a `protontui --standalone connect` process, or cleans up after one that
+    /// crashed, and releases a kill switch a failed connection left (unless it's permanent).
+    pub async fn disconnect() -> Result<ExitCode> {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let Some(state) = RuntimeState::load()? else {
+            if nix::unistd::geteuid().is_root() {
+                let settings = Settings::load(&Paths::detect()?.settings_file())?;
+                vpn::engine::apply_idle_kill_switch(&settings).await?;
+            }
+            println!("Not connected.");
+            return Ok(ExitCode::SUCCESS);
+        };
+        if !state.owner_alive() {
+            if !nix::unistd::geteuid().is_root() {
+                bail!(
+                    "a crashed connection left changes behind; clean them up with `doas protontui --standalone disconnect`"
+                );
+            }
+            for action in vpn::engine::cleanup_stale().await? {
+                println!("✓ {action}");
+            }
+            println!("Disconnected (cleaned up after a crashed run).");
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let pid = Pid::from_raw(state.pid as i32);
+        match kill(pid, Signal::SIGTERM) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EPERM) => {
+                bail!("the connection belongs to root: run `doas protontui --standalone disconnect`")
+            }
+            Err(e) => return Err(e).context("signalling the connection process"),
+        }
+        // Teardown takes a moment (DNS, routes, link); wait for the process to drop its record.
+        for _ in 0..100 {
+            if RuntimeState::load()?.is_none() || !process_running(state.pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        match RuntimeState::load()? {
+            None => {
+                println!("Disconnected.");
+                Ok(ExitCode::SUCCESS)
+            }
+            Some(_) => bail!(
+                "the connection process (pid {}) didn't finish disconnecting; try `doas protontui recover`",
+                state.pid
+            ),
+        }
+    }
+
+    fn process_running(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
 }

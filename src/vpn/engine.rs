@@ -22,17 +22,19 @@ use rtnetlink::packet_core::NetlinkPayload;
 use rtnetlink::packet_route::RouteNetlinkMessage;
 use rtnetlink::packet_route::link::LinkAttribute;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::servers::{ClientConfig, DeviceLocation};
-use crate::config::{self, Paths, Settings};
+use crate::config::{self, KillSwitchMode, Paths, Settings};
 use crate::servers::cache::{self, Refresh};
 use crate::servers::model::{ServerList, Visibility};
 use crate::servers::select::{self, Request};
 use crate::servers::signature;
 use crate::session::Session;
-use crate::vpn::keys::{self, CertificateFeatures, VpnKeys};
+use crate::vpn::keys::{self, CertificateFeatures, StoredCertificate, VpnKeys};
+use crate::vpn::killswitch::{self, Rules};
+use crate::vpn::local_agent::{self, Agent, AgentEvent, AgentParams, NetShieldStats};
 use crate::vpn::wireguard::{self, INTERFACE, Peer, PeerStats, Tunnel, TunnelConfig};
 use crate::vpn::{dns, routing};
 
@@ -52,6 +54,8 @@ pub const STALE_HANDSHAKE: Duration = Duration::from_secs(180);
 /// Network events are collected for this long before the tunnel is checked.
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// A certificate the local agent rejects again within this time after a renewal ends the connection.
+const CERTIFICATE_RENEWAL_BACKOFF: Duration = Duration::from_secs(600);
 const DEFAULT_WIREGUARD_PORT: u16 = 51820;
 
 /// The server a connection uses. Public data only.
@@ -131,6 +135,65 @@ pub enum Event {
     Location(DeviceLocation),
     /// Something the user should know that doesn't stop the connection.
     Warning(String),
+    /// The port forwarded to this host by the server (local agent), or `None` when there's none (any more).
+    PortForward(Option<u16>),
+    /// NetShield's counters for this connection (local agent).
+    NetShieldStats(NetShieldStats),
+}
+
+/// The latest values of the per-connection events, for clients that join mid-connection. Reset when a
+/// connection ends.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Details {
+    pub stats: Option<Stats>,
+    pub location: Option<DeviceLocation>,
+    pub forwarded_port: Option<u16>,
+    pub netshield: Option<NetShieldStats>,
+}
+
+impl Details {
+    fn record(&mut self, event: &Event) {
+        match event {
+            Event::Stats(stats) => self.stats = Some(*stats),
+            Event::Location(location) => self.location = Some(location.clone()),
+            Event::PortForward(port) => self.forwarded_port = *port,
+            Event::NetShieldStats(stats) => self.netshield = Some(*stats),
+            Event::StateChanged(_) | Event::Warning(_) => {}
+        }
+    }
+}
+
+/// The kill switch settings a connection runs with, kept in the state record so that cleanup after a crash
+/// knows whether the rules must stay (permanent mode).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KillSwitchRecord {
+    pub mode: KillSwitchMode,
+    pub allow_lan: bool,
+}
+
+impl From<&Settings> for KillSwitchRecord {
+    fn from(settings: &Settings) -> Self {
+        Self { mode: settings.kill_switch, allow_lan: settings.allow_lan }
+    }
+}
+
+impl KillSwitchRecord {
+    /// Rules that block everything outside the tunnel, with nothing connected.
+    fn idle_rules(self) -> Rules {
+        Rules { allow_lan: self.allow_lan, ..Rules::default() }
+    }
+}
+
+/// Puts the kill switch in its state for "not connected": installed (without endpoint) in permanent mode,
+/// removed otherwise. The daemon calls this at start and when the setting changes while disconnected.
+pub async fn apply_idle_kill_switch(settings: &Settings) -> Result<()> {
+    let record = KillSwitchRecord::from(settings);
+    if record.mode == KillSwitchMode::Permanent {
+        killswitch::apply(&record.idle_rules()).await?;
+        killswitch::delete_table("ip6", killswitch::IPV6_LEAK_TABLE).await
+    } else {
+        killswitch::remove().await
+    }
 }
 
 /// What [`STATE_FILE_NAME`] holds.
@@ -149,6 +212,8 @@ pub struct RuntimeState {
     pub server: Option<ServerInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connected_since: Option<u64>,
+    #[serde(default)]
+    pub kill_switch: KillSwitchRecord,
 }
 
 impl RuntimeState {
@@ -204,18 +269,22 @@ pub async fn cleanup_stale() -> Result<Vec<String>> {
     let mut actions = vec![format!("cleaned up after pid {}", state.pid)];
     let (connection, handle, _) = rtnetlink::new_connection().context("opening netlink")?;
     let task = tokio::spawn(connection);
-    let result = teardown_host(&handle, state.dns, state.ifindex).await;
+    // A permanent kill switch stays; anything else goes with the crashed connection.
+    let keep = (state.kill_switch.mode == KillSwitchMode::Permanent).then(|| state.kill_switch.idle_rules());
+    let result = teardown_host(&handle, state.dns, state.ifindex, keep).await;
     task.abort();
     actions.extend(result?);
     RuntimeState::remove()?;
     Ok(actions)
 }
 
-/// Undoes DNS, routing and the tunnel link. Idempotent, and works on partial setups.
+/// Undoes DNS, routing and the tunnel link, then removes the kill switch, or leaves `keep_kill_switch`
+/// installed (permanent mode, or standard mode after a failure). Idempotent, and works on partial setups.
 async fn teardown_host(
     handle: &Handle,
     dns_backend: Option<dns::Backend>,
     ifindex: Option<u32>,
+    keep_kill_switch: Option<Rules>,
 ) -> Result<Vec<String>> {
     let mut actions = Vec::new();
     let mut errors = Vec::new();
@@ -238,6 +307,20 @@ async fn teardown_host(
         Ok(done) => actions.extend(done),
         Err(e) => errors.push(format!("wireguard: {e:#}")),
     }
+    // Last, so nothing leaks while the rest comes down.
+    let kill_switch = match &keep_kill_switch {
+        Some(rules) => killswitch::apply(rules)
+            .await
+            .map(|()| actions.push("kill switch stays on, blocking traffic outside the tunnel".into())),
+        None => killswitch::remove().await,
+    };
+    let leak_table = match keep_kill_switch {
+        Some(_) => killswitch::delete_table("ip6", killswitch::IPV6_LEAK_TABLE).await,
+        None => Ok(()),
+    };
+    if let Err(e) = kill_switch.and(leak_table) {
+        errors.push(format!("kill switch: {e:#}"));
+    }
     if errors.is_empty() { Ok(actions) } else { Err(anyhow!(errors.join("; "))) }
 }
 
@@ -252,6 +335,9 @@ struct Inner {
     paths: Paths,
     state: watch::Sender<ConnectionState>,
     events: broadcast::Sender<Event>,
+    details: Arc<std::sync::Mutex<Details>>,
+    /// Settings changed while connected, for the connection task to apply live.
+    settings: watch::Sender<Option<Settings>>,
     running: Mutex<Option<Running>>,
 }
 
@@ -263,12 +349,27 @@ struct Running {
 impl Engine {
     /// Cleans up after a crashed run if needed, then returns an idle engine. Needs root.
     pub async fn start(session: Arc<Session>, paths: Paths) -> Result<Self> {
-        for action in cleanup_stale().await? {
-            tracing::info!("startup cleanup: {action}");
+        // Without root there's nothing this process could clean (or connect); development runs get this far.
+        if nix::unistd::geteuid().is_root() {
+            for action in cleanup_stale().await? {
+                tracing::info!("startup cleanup: {action}");
+            }
         }
         let (state, _) = watch::channel(ConnectionState::Disconnected);
         let (events, _) = broadcast::channel(256);
-        Ok(Self { inner: Arc::new(Inner { session, paths, state, events, running: Mutex::new(None) }) })
+        let (settings, _) = watch::channel(None);
+        let inner =
+            Inner { session, paths, state, events, details: Default::default(), settings, running: Mutex::new(None) };
+        Ok(Self { inner: Arc::new(inner) })
+    }
+
+    pub fn session(&self) -> &Arc<Session> {
+        &self.inner.session
+    }
+
+    /// The latest stats, location, forwarded port and NetShield counters of the current connection.
+    pub fn details(&self) -> Details {
+        self.inner.details.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -295,24 +396,50 @@ impl Engine {
         Ok(())
     }
 
-    /// Disconnects and waits until the host is back to its original state.
+    /// Disconnects and waits until the host is back to its original state. After a failed connection (state
+    /// `Error`), this is what releases a standard kill switch that kept blocking.
     pub async fn disconnect(&self) -> Result<()> {
-        let Some(running) = self.inner.running.lock().await.take() else {
-            return Ok(());
-        };
-        let _ = running.cancel.send(true);
-        running.task.await.context("the connection task panicked")
+        if let Some(running) = self.inner.running.lock().await.take() {
+            let _ = running.cancel.send(true);
+            running.task.await.context("the connection task panicked")?;
+        }
+        if matches!(self.state(), ConnectionState::Error { .. }) {
+            let settings = Settings::load(&self.inner.paths.settings_file())?;
+            apply_idle_kill_switch(&settings).await?;
+            self.inner.set_state(ConnectionState::Disconnected);
+        }
+        Ok(())
+    }
+
+    /// Applies changed settings: live to a running connection (kill switch, local agent features), or to the
+    /// idle kill switch. The caller has saved them already; IPv6 and DNS changes wait for the next connection.
+    pub async fn apply_settings(&self, settings: Settings) -> Result<()> {
+        let running = self.inner.running.lock().await;
+        let active = running.as_ref().is_some_and(|r| !r.task.is_finished());
+        self.inner.settings.send_replace(Some(settings.clone()));
+        if !active && !matches!(self.state(), ConnectionState::Error { .. }) {
+            apply_idle_kill_switch(&settings).await?;
+        }
+        Ok(())
     }
 }
 
 impl Inner {
     fn set_state(&self, state: ConnectionState) {
         tracing::info!("state: {}", describe(&state));
+        if !state.is_active()
+            && let Ok(mut details) = self.details.lock()
+        {
+            *details = Details::default();
+        }
         self.state.send_replace(state.clone());
         let _ = self.events.send(Event::StateChanged(state));
     }
 
     fn emit(&self, event: Event) {
+        if let Ok(mut details) = self.details.lock() {
+            details.record(&event);
+        }
         let _ = self.events.send(event);
     }
 }
@@ -336,15 +463,17 @@ struct Connection {
     rt: Handle,
     rt_task: JoinHandle<()>,
     tunnel: Option<Tunnel>,
+    agent: Option<Agent>,
     record: RuntimeState,
 }
 
 impl Connection {
-    fn new() -> Result<Self> {
+    fn new(kill_switch: KillSwitchRecord) -> Result<Self> {
         let (connection, rt, _) = rtnetlink::new_connection().context("opening netlink")?;
-        let record = RuntimeState { pid: std::process::id(), started_at: config::unix_now(), ..Default::default() };
+        let record =
+            RuntimeState { pid: std::process::id(), started_at: config::unix_now(), kill_switch, ..Default::default() };
         record.save()?;
-        Ok(Self { rt, rt_task: tokio::spawn(connection), tunnel: None, record })
+        Ok(Self { rt, rt_task: tokio::spawn(connection), tunnel: None, agent: None, record })
     }
 
     fn update(&mut self, change: impl FnOnce(&mut RuntimeState)) {
@@ -354,9 +483,43 @@ impl Connection {
         }
     }
 
-    async fn teardown(mut self) -> Result<()> {
+    fn kill_switch_rules(&self, endpoint: SocketAddrV4, ipv6: bool) -> Rules {
+        Rules { allow_lan: self.record.kill_switch.allow_lan, ipv6, endpoint: Some(endpoint), api: None }
+    }
+
+    /// Blocks everything but the tunnel and `endpoint` while (re)connecting. As in api-core, this happens even
+    /// with the kill switch off, so that nothing leaks while servers change; then without `nft` it's skipped.
+    async fn arm_kill_switch(&self, endpoint: SocketAddrV4, ipv6: bool) -> Result<()> {
+        match killswitch::apply(&self.kill_switch_rules(endpoint, ipv6)).await {
+            Err(e) if self.record.kill_switch.mode == KillSwitchMode::Off => {
+                tracing::debug!("no kill switch while connecting: {e:#}");
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// The kill switch once connected: off mode keeps only IPv6 leak protection; the other modes keep blocking
+    /// everything outside the tunnel.
+    async fn settle_kill_switch(&self, endpoint: SocketAddrV4, ipv6: bool) -> Result<()> {
+        if self.record.kill_switch.mode == KillSwitchMode::Off {
+            killswitch::delete_table("inet", killswitch::TABLE).await?;
+            if let Err(e) = killswitch::apply_ipv6_leak_protection().await {
+                tracing::warn!("IPv6 leak protection: {e:#}");
+            }
+            Ok(())
+        } else {
+            killswitch::apply(&self.kill_switch_rules(endpoint, ipv6)).await?;
+            killswitch::delete_table("ip6", killswitch::IPV6_LEAK_TABLE).await
+        }
+    }
+
+    async fn teardown(mut self, keep_kill_switch: bool) -> Result<()> {
+        // The agent's TLS connection runs through the tunnel; stop it first.
+        drop(self.agent.take());
         let record = self.record.clone();
-        let result = teardown_host(&self.rt, record.dns, record.ifindex).await;
+        let keep = keep_kill_switch.then(|| record.kill_switch.idle_rules());
+        let result = teardown_host(&self.rt, record.dns, record.ifindex, keep).await;
         // After the link is gone: stops a userspace device's threads.
         if let Some(tunnel) = self.tunnel.take() {
             tunnel.destroy().await;
@@ -370,6 +533,7 @@ impl Connection {
 /// Everything a connection attempt needs, gathered before touching the network.
 struct Prepared {
     settings: Settings,
+    tier: u8,
     keys: VpnKeys,
     client_config: ClientConfig,
     /// Best first; `port` is still 0.
@@ -393,7 +557,16 @@ async fn run_connection(inner: Arc<Inner>, request: Request, mut cancelled: watc
     }
     inner.set_state(ConnectionState::Disconnecting);
     let teardown = match connection {
-        Some(connection) => connection.teardown().await,
+        Some(connection) => {
+            // Permanent: always. Standard: after a failure, until the user disconnects (api-core's Error state
+            // keeps it too). Off: never.
+            let keep = match connection.record.kill_switch.mode {
+                KillSwitchMode::Permanent => true,
+                KillSwitchMode::Standard => outcome.is_err(),
+                KillSwitchMode::Off => false,
+            };
+            connection.teardown(keep).await
+        }
         None => Ok(()),
     };
     // The session's HTTP connections went through the tunnel; don't reuse them.
@@ -413,8 +586,21 @@ async fn run_connection(inner: Arc<Inner>, request: Request, mut cancelled: watc
 }
 
 async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option<Connection>) -> Result<()> {
-    let prepared = prepare(inner, request).await?;
-    let connection = slot.insert(Connection::new()?);
+    let settings = Settings::load(&inner.paths.settings_file())?;
+    // Changes from now on reach the monitor loop.
+    let mut settings_changes = inner.settings.subscribe();
+    let connection = slot.insert(Connection::new(KillSwitchRecord::from(&settings))?);
+    if settings.kill_switch == KillSwitchMode::Permanent {
+        // The permanent kill switch blocks the API too; open a hole for it until the tunnel is up.
+        let base_url = inner.session.api().base_url().to_owned();
+        let host = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_owned));
+        let host = host.with_context(|| format!("no host in the API URL {base_url}"))?;
+        killswitch::open_api_window(&connection.record.kill_switch.idle_rules(), &host)
+            .await
+            .context("letting the API through the permanent kill switch")?;
+    }
+    let mut prepared = prepare(inner, request, settings).await?;
+    let (agent_events_tx, mut agent_events) = mpsc::unbounded_channel();
     let (mut index, mut server) = establish(inner, &prepared, connection, 0).await?;
 
     // DNS
@@ -426,7 +612,8 @@ async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option
     backend.apply(ifindex.unwrap_or(0), &servers).await?;
     tracing::info!("DNS via {backend:?}: {servers:?}");
 
-    // The local agent (T3.7) connects here.
+    connection.settle_kill_switch(endpoint_of(&server), prepared.ipv6).await?;
+    start_agent(inner, &prepared, connection, &server, &agent_events_tx);
 
     let since = config::unix_now();
     connection.update(|r| {
@@ -439,22 +626,68 @@ async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option
 
     // Monitor until something fails beyond repair; cancellation ends it from outside.
     loop {
-        let reason = monitor(inner, &prepared, connection).await?;
+        let reason = monitor(
+            inner,
+            &mut prepared,
+            connection,
+            &server,
+            &mut agent_events,
+            &agent_events_tx,
+            &mut settings_changes,
+        )
+        .await?;
         tracing::warn!("re-establishing the tunnel: {reason}");
         inner.set_state(ConnectionState::Reconnecting { server: server.clone(), reason });
         // The same server first: after a network change it usually just needs a new handshake.
         (index, server) = establish(inner, &prepared, connection, index).await?;
+        connection.settle_kill_switch(endpoint_of(&server), prepared.ipv6).await?;
+        start_agent(inner, &prepared, connection, &server, &agent_events_tx);
         inner.session.api().reset_connections();
         inner.set_state(ConnectionState::Connected { server: server.clone(), since });
         spawn_location_fetch(inner);
     }
 }
 
-/// Loads settings, account, client config and servers, and the certificate; picks the candidates.
-async fn prepare(inner: &Inner, request: &Request) -> Result<Prepared> {
+fn endpoint_of(server: &ServerInfo) -> SocketAddrV4 {
+    SocketAddrV4::new(server.entry_ip, server.port)
+}
+
+/// (Re)starts the local agent client for `server`, replacing a previous one.
+fn start_agent(
+    inner: &Inner,
+    prepared: &Prepared,
+    connection: &mut Connection,
+    server: &ServerInfo,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) {
+    drop(connection.agent.take());
+    if inner.details.lock().is_ok_and(|d| d.forwarded_port.is_some()) {
+        inner.emit(Event::PortForward(None));
+    }
+    let certificate = match StoredCertificate::load(&inner.paths.certificate_file()) {
+        Ok(Some(certificate)) => certificate,
+        Ok(None) => {
+            tracing::warn!("no certificate for the local agent");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("loading the certificate for the local agent: {e:#}");
+            return;
+        }
+    };
+    let params = AgentParams {
+        domain: server.domain.clone(),
+        key_pem: prepared.keys.ed25519_private_pem(),
+        certificate_pem: certificate.certificate,
+    };
+    let features = local_agent::features_for(&prepared.settings, prepared.tier, &server.label);
+    connection.agent = Some(Agent::spawn(params, features, events.clone()));
+}
+
+/// Loads account, client config and servers, and the certificate; picks the candidates.
+async fn prepare(inner: &Inner, request: &Request, settings: Settings) -> Result<Prepared> {
     let paths = &inner.paths;
     let api = inner.session.api();
-    let settings = Settings::load(&paths.settings_file())?;
     let account = inner.session.account().await.context("fetching account info")?;
     let tier = account.max_tier;
 
@@ -513,7 +746,7 @@ async fn prepare(inner: &Inner, request: &Request) -> Result<Prepared> {
     }
     let best = list.by_id(&candidates[0].logical_id).context("candidate vanished from the list")?;
     let ipv6 = settings.ipv6 && best.features.ipv6();
-    Ok(Prepared { settings, keys, client_config, candidates, peer_keys, ipv6 })
+    Ok(Prepared { settings, tier, keys, client_config, candidates, peer_keys, ipv6 })
 }
 
 /// Brings the tunnel up with the first candidate (from `start`, wrapping around) that completes a handshake.
@@ -539,14 +772,11 @@ async fn establish(
             inner.set_state(ConnectionState::Connecting { server: Some(server.clone()) });
             let config = TunnelConfig {
                 private_key: prepared.keys.x25519_private(),
-                peer: Peer {
-                    public_key: prepared.peer_keys[index],
-                    endpoint: SocketAddr::V4(SocketAddrV4::new(server.entry_ip, port)),
-                },
+                peer: Peer { public_key: prepared.peer_keys[index], endpoint: SocketAddr::V4(endpoint_of(&server)) },
                 fwmark: routing::FWMARK,
                 ipv6: prepared.ipv6,
             };
-            match try_server(connection, &config).await {
+            match try_server(connection, &config, endpoint_of(&server)).await {
                 Ok(()) => {
                     tracing::info!("handshake with {} ({}:{port})", server.name, server.entry_ip);
                     connection.update(|r| r.server = Some(server.clone()));
@@ -563,8 +793,11 @@ async fn establish(
     Err(last_error.unwrap_or_else(|| anyhow!("no server to try")).context("no server answered"))
 }
 
-/// Creates (or re-points) the tunnel for `config` and waits for a handshake.
-async fn try_server(connection: &mut Connection, config: &TunnelConfig) -> Result<()> {
+/// Arms the kill switch for `endpoint`, creates (or re-points) the tunnel for `config` and waits for a
+/// handshake.
+async fn try_server(connection: &mut Connection, config: &TunnelConfig, endpoint: SocketAddrV4) -> Result<()> {
+    // Before the link and routes exist, and swapped atomically to the new endpoint on failover.
+    connection.arm_kill_switch(endpoint, config.ipv6).await?;
     match connection.tunnel.as_mut() {
         Some(tunnel) => tunnel.set_device(config).await?,
         None => {
@@ -617,9 +850,18 @@ fn poke_tunnel() {
     }
 }
 
-/// Runs while connected: 1 Hz stats, the handshake watchdog, network-change detection, and certificate
-/// refresh. Returns the reason when the tunnel needs re-establishing.
-async fn monitor(inner: &Inner, prepared: &Prepared, connection: &mut Connection) -> Result<String> {
+/// Runs while connected: 1 Hz stats, the handshake watchdog, network-change detection, certificate refresh,
+/// local agent events and live settings changes. Returns the reason when the tunnel needs re-establishing;
+/// errors end the connection.
+async fn monitor(
+    inner: &Inner,
+    prepared: &mut Prepared,
+    connection: &mut Connection,
+    server: &ServerInfo,
+    agent_events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    agent_events_tx: &mpsc::UnboundedSender<AgentEvent>,
+    settings_changes: &mut watch::Receiver<Option<Settings>>,
+) -> Result<String> {
     let (net_connection, _, mut net_events) = rtnetlink::new_multicast_connection(&[
         rtnetlink::MulticastGroup::Link,
         rtnetlink::MulticastGroup::Ipv4Route,
@@ -635,6 +877,7 @@ async fn monitor(inner: &Inner, prepared: &Prepared, connection: &mut Connection
     let mut certificate_check = tokio::time::interval(CERTIFICATE_CHECK_INTERVAL);
     let mut previous: Option<(PeerStats, Instant)> = None;
     let mut network_changed_at: Option<Instant> = None;
+    let mut certificate_renewed_at: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -666,7 +909,71 @@ async fn monitor(inner: &Inner, prepared: &Prepared, connection: &mut Connection
                     tracing::warn!("refreshing the certificate: {e:#}");
                 }
             }
+            Some(event) = agent_events.recv() => match event {
+                AgentEvent::Connected { .. } => {}
+                AgentEvent::PortForward(port) => inner.emit(Event::PortForward(port)),
+                AgentEvent::NetShieldStats(stats) => inner.emit(Event::NetShieldStats(stats)),
+                AgentEvent::Warning(warning) => inner.emit(Event::Warning(warning)),
+                AgentEvent::Jailed { code, description } => bail!(local_agent::describe_jail(code, &description)),
+                // The tunnel itself still works, so a rejected certificate costs only the agent's features: warn,
+                // never end the connection over it.
+                AgentEvent::CertificateRejected(reason) => {
+                    if certificate_renewed_at.is_some_and(|at| at.elapsed() < CERTIFICATE_RENEWAL_BACKOFF) {
+                        tracing::warn!("the local agent keeps rejecting the VPN certificate: {reason}");
+                        inner.emit(Event::Warning(format!(
+                            "the local agent keeps rejecting the VPN certificate ({reason}): live feature changes, \
+                             port forwarding and NetShield statistics are unavailable on this connection"
+                        )));
+                        continue;
+                    }
+                    tracing::warn!("the local agent rejected the certificate ({reason}); requesting a new one");
+                    certificate_renewed_at = Some(Instant::now());
+                    let features = CertificateFeatures::from_settings(&prepared.settings, prepared.tier);
+                    match keys::request_certificate(inner.session.api(), &prepared.keys, features).await {
+                        Ok(certificate) => {
+                            if let Err(e) = certificate.save(&inner.paths.certificate_file()) {
+                                tracing::warn!("saving the certificate: {e:#}");
+                            }
+                            start_agent(inner, prepared, connection, server, agent_events_tx);
+                        }
+                        Err(e) => tracing::warn!("requesting a new certificate: {e:#}"),
+                    }
+                }
+            },
+            Ok(()) = settings_changes.changed() => {
+                let changed = settings_changes.borrow_and_update().clone();
+                if let Some(settings) = changed {
+                    apply_live_settings(inner, prepared, connection, server, settings).await;
+                }
+            }
         }
+    }
+}
+
+/// Settings changed while connected: the kill switch and the local agent's features follow at once (the
+/// certificate check picks up the features too); IPv6 and DNS changes need a new connection.
+async fn apply_live_settings(
+    inner: &Inner,
+    prepared: &mut Prepared,
+    connection: &mut Connection,
+    server: &ServerInfo,
+    settings: Settings,
+) {
+    let old = std::mem::replace(&mut prepared.settings, settings);
+    let settings = &prepared.settings;
+    let kill_switch = KillSwitchRecord::from(settings);
+    if kill_switch != connection.record.kill_switch {
+        connection.update(|r| r.kill_switch = kill_switch);
+        match connection.settle_kill_switch(endpoint_of(server), prepared.ipv6).await {
+            Ok(()) => tracing::info!("kill switch now {:?} (LAN allowed: {})", kill_switch.mode, kill_switch.allow_lan),
+            Err(e) => inner.emit(Event::Warning(format!("changing the kill switch: {e:#}"))),
+        }
+    }
+    if let Some(agent) = &connection.agent {
+        agent.set_features(local_agent::features_for(settings, prepared.tier, &server.label));
+    }
+    if old.ipv6 != settings.ipv6 || old.custom_dns != settings.custom_dns {
+        inner.emit(Event::Warning("IPv6 and DNS changes apply at the next connection: reconnect to apply".into()));
     }
 }
 
@@ -750,11 +1057,16 @@ async fn dns_servers(settings: &Settings, inner: &Inner) -> Vec<IpAddr> {
 fn spawn_location_fetch(inner: &Inner) {
     let api = inner.session.api().clone();
     let events = inner.events.clone();
+    let details = inner.details.clone();
     tokio::spawn(async move {
         match api.location().await {
             Ok(location) => {
                 tracing::debug!("public IP now {}", location.ip);
-                let _ = events.send(Event::Location(location));
+                let event = Event::Location(location);
+                if let Ok(mut details) = details.lock() {
+                    details.record(&event);
+                }
+                let _ = events.send(event);
             }
             Err(e) => tracing::warn!("vpn/location after connecting: {e}"),
         }

@@ -105,7 +105,7 @@ impl Session {
 
     /// Revokes the session on the server (best effort: logging out offline still wipes local state), then
     /// deletes the session, keys, certificate and account cache.
-    pub async fn logout(self) -> Result<()> {
+    pub async fn logout(&self) -> Result<()> {
         if let Err(e) = self.api.revoke_session().await {
             tracing::warn!("revoking the session on the server failed: {e}");
         }

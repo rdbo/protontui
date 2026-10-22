@@ -80,6 +80,11 @@ impl Paths {
         self.state_dir.join("settings.toml")
     }
 
+    /// Free-plan "Change server" bookkeeping (T4.2).
+    pub fn change_server_file(&self) -> PathBuf {
+        self.state_dir.join("change_server.json")
+    }
+
     /// Everything tied to a signed-in account, removed by logout.
     pub fn account_bound_files(&self) -> [PathBuf; 4] {
         [self.session_file(), self.account_file(), self.keys_file(), self.certificate_file()]

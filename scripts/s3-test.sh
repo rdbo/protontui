@@ -63,7 +63,7 @@ public_ip6() { $X curl -6 -s -m 10 https://ifconfig.me; }
 
 start_connect() {
     # $1: log file, extra env in $2
-    env ${2:-} $X "$BIN" connect --country "$COUNTRY" > "$1" 2>&1 &
+    env ${2:-} $X "$BIN" --standalone connect --country "$COUNTRY" > "$1" 2>&1 &
     CONNECT_PID=$!
     i=0
     while [ $i -lt 90 ]; do
@@ -100,11 +100,11 @@ check_connected() {
     fi
     if $X nslookup proton.me > "$WORK/nslookup" 2>&1; then ok "$label: DNS resolves through the tunnel"; else ko "$label: DNS lookup failed"; fi
     sed 's/^/    /' "$WORK/nslookup"
-    echo "  status:"; $X "$BIN" status 2>&1 | sed 's/^/    /'
+    echo "  status:"; $X "$BIN" --standalone status 2>&1 | sed 's/^/    /'
 }
 
 section "baseline ($MODE)"
-if $X "$BIN" status 2>&1 | grep -q "Not signed in"; then
+if $X "$BIN" --standalone status 2>&1 | grep -q "Not signed in"; then
     echo "root has no session: run \`doas $BIN login\` first (state in /var/lib/protontui)"
     [ "$MODE" = netns ] && sh "$(dirname "$0")/netns-lab.sh" down
     exit 1
@@ -123,7 +123,7 @@ section "connect + clean disconnect (kernel WireGuard)"
 if start_connect "$WORK/connect1.log"; then
     ok "connect: connected"
     check_connected "kernel"
-    $X "$BIN" disconnect
+    $X "$BIN" --standalone disconnect
     wait "$CONNECT_PID"
     echo "  connect exit code: $?"
     compare_with_baseline "after disconnect"
@@ -151,7 +151,7 @@ if start_connect "$WORK/connect3.log"; then
     if start_connect "$WORK/connect4.log"; then
         ok "reconnect after crash"
         sed 's/^/    | /' "$WORK/connect4.log"
-        $X "$BIN" disconnect; wait "$CONNECT_PID"
+        $X "$BIN" --standalone disconnect; wait "$CONNECT_PID"
         compare_with_baseline "after crash + reconnect + disconnect"
     else
         ko "connect after a crash failed"; sed 's/^/    | /' "$WORK/connect4.log"; $X "$BIN" recover
@@ -172,7 +172,7 @@ if start_connect "$WORK/connect5.log" PROTONTUI_WG_BACKEND=userspace; then
         $X ip -4 addr show proton0 2>&1 | sed 's/^/    /'
         tail -n 30 /root/.local/state/protontui/protontui.log 2>/dev/null | sed 's/^/    log: /'
     fi
-    $X "$BIN" disconnect; wait "$CONNECT_PID"
+    $X "$BIN" --standalone disconnect; wait "$CONNECT_PID"
     compare_with_baseline "after userspace disconnect"
 else
     ko "userspace: no connection"; sed 's/^/    | /' "$WORK/connect5.log"; kill "$CONNECT_PID" 2>/dev/null; $X "$BIN" recover

@@ -24,7 +24,8 @@ pub const MAX_PHYSICAL_SERVERS_PER_LOGICAL: usize = 2;
 pub const MAX_CANDIDATES: usize = 64;
 
 /// Where to connect.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Intent {
     /// Lowest score anywhere.
     Fastest,
@@ -65,11 +66,13 @@ pub enum FeatureFilter {
     Streaming,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub intent: Intent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature: Option<FeatureFilter>,
     /// Logical server ID to leave out (the current one, when changing server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<String>,
 }
 

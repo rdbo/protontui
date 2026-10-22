@@ -5,7 +5,7 @@
 #   doas sh scripts/netns-lab.sh down    # remove it again
 #
 # Inside the namespace run e.g.:
-#   doas ip netns exec ptest env PROTONTUI_DNS_BACKEND=file ./protontui connect --country CH
+#   doas ip netns exec ptest env PROTONTUI_DNS_BACKEND=file ./protontui --standalone connect --country CH
 #
 # Host changes while the lab is up: a veth pair (ptest-host), net.ipv4.ip_forward=1 (the previous value is
 # restored by `down`), an nftables table `ip ptestlab` doing masquerade, and two accept rules for the veth

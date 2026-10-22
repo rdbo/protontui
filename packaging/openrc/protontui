@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+# OpenRC service for the protontui daemon (Alpine). Install as /etc/init.d/protontui, then
+# `rc-update add protontui default`.
+
+name="protontui"
+description="Proton VPN daemon (protontui): WireGuard connection, kill switch and IPC for the TUI"
+command="/usr/local/bin/protontui"
+command_args="daemon"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+# SIGTERM disconnects cleanly (a permanent kill switch stays armed); give the teardown time.
+retry="TERM/30/KILL/5"
+
+depend() {
+	need net
+	use dns logger
+	# Firewall services that load a ruleset with `flush ruleset` would wipe the kill switch table: start after
+	# them, so a permanent kill switch is re-armed last.
+	after firewall nftables iptables ip6tables
+}

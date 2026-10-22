@@ -1,0 +1,19 @@
+# systemd unit for the protontui daemon. Install as /etc/systemd/system/protontui.service, then
+# `systemctl enable --now protontui`.
+[Unit]
+Description=Proton VPN daemon (protontui)
+Wants=network-online.target
+# After firewall services that load a ruleset with `flush ruleset`, which would wipe the kill switch table.
+After=network-online.target nftables.service firewalld.service iptables.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/protontui daemon
+# SIGTERM disconnects cleanly (a permanent kill switch stays armed).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
