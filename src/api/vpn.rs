@@ -1,7 +1,8 @@
-//! VPN account endpoints (`vpn/v2`, `core/v4/users`). Certificate, client config and location follow in
-//! Phases 2 and 3.
+//! VPN account endpoints (`vpn/v2`, `core/v4/users`) and the connection certificate (`vpn/v1/certificate`).
+//! Client config and location live in [`super::servers`].
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use super::{ApiClient, ApiError};
 
@@ -53,7 +54,45 @@ pub struct User {
     pub email: Option<String>,
 }
 
+/// `POST vpn/v1/certificate` (win-app `CertificateRequest`; features as api-core's `_convert_features`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CertificateRequest {
+    /// Ed25519 public key, SPKI PEM.
+    pub client_public_key: String,
+    /// Always `EC`.
+    pub client_public_key_mode: String,
+    pub device_name: String,
+    /// e.g. `10080 min`.
+    pub duration: String,
+    /// Always `session`.
+    pub mode: String,
+    /// Only the features that differ from the server defaults; omitted when empty.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub features: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CertificateResponse {
+    /// X.509 certificate, PEM.
+    pub certificate: String,
+    /// Unix seconds.
+    pub expiration_time: u64,
+    /// Unix seconds; ask for a new certificate after this.
+    pub refresh_time: u64,
+    /// base64(SHA-512(client X25519 public key)), as api-core's `proton_fingerprint`.
+    #[serde(default)]
+    pub client_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub server_public_key: Option<String>,
+}
+
 impl ApiClient {
+    pub async fn request_certificate(&self, request: &CertificateRequest) -> Result<CertificateResponse, ApiError> {
+        self.post("vpn/v1/certificate", request).await
+    }
+
     pub async fn vpn_info(&self) -> Result<VpnInfoWrapper, ApiError> {
         self.get("vpn/v2").await
     }

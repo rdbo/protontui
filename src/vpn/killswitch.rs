@@ -13,6 +13,32 @@ pub const TABLE: &str = "protontui";
 /// Every nftables table protontui creates starts with this, whatever its family.
 pub const TABLE_PREFIX: &str = "protontui";
 
+/// Applies an nftables script atomically (`nft -f -`). `Ok(false)` when there's no `nft` binary.
+pub async fn nft_apply(script: &str) -> Result<bool> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = match Command::new("nft").args(["-f", "-"]).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).context("running nft"),
+    };
+    let mut stdin = child.stdin.take().context("nft stdin")?;
+    stdin.write_all(script.as_bytes()).await?;
+    drop(stdin);
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        bail!("nft -f: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(true)
+}
+
+/// Deletes one table if it exists.
+pub async fn delete_table(family: &str, name: &str) -> Result<()> {
+    // `destroy` would be idempotent but needs nft ≥ 1.0.8; create-then-delete works everywhere.
+    nft_apply(&format!("table {family} {name} {{}}\ndelete table {family} {name}\n")).await.map(drop)
+}
+
 /// Deletes every nftables table protontui created.
 pub async fn recover() -> Result<Vec<String>> {
     let output = match Command::new("nft").args(["list", "tables"]).output().await {

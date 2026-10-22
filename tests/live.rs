@@ -162,3 +162,38 @@ async fn live_signatures_verify() {
         assert!(selection.candidates.iter().all(|c| c.logical.enabled && c.logical.tier <= tier));
     }
 }
+
+/// T3.1: the API certifies a freshly generated key, and the response's fingerprint matches our X25519
+/// derivation. Uses the stored session; keys and certificate go to a temporary directory.
+#[tokio::test]
+async fn live_certificate() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    use protontui::config::{Paths, Settings};
+    use protontui::vpn::keys::{self, CertificateFeatures, VpnKeys};
+
+    let paths = Paths::detect().unwrap();
+    let Some(session) =
+        protontui::session::Session::restore(ApiClient::new(DEFAULT_BASE_URL).unwrap(), &paths).unwrap()
+    else {
+        eprintln!("skipped: not signed in (run `protontui login`)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let temp_paths = Paths::at(dir.path());
+    let keys = VpnKeys::load_or_generate(&temp_paths.keys_file()).unwrap();
+    let features = CertificateFeatures::from_settings(&Settings::default(), 2);
+    // `request_certificate` fails when the API's ClientKeyFingerprint differs from ours.
+    let cert = keys::ensure_certificate(session.api(), &temp_paths, &keys, features).await.unwrap();
+    let now = protontui::config::unix_now();
+    eprintln!(
+        "certificate for {}: refresh in {} h, expires in {} h",
+        keys::device_name(),
+        (cert.refresh_time - now) / 3600,
+        (cert.expiration_time - now) / 3600
+    );
+    assert!(cert.certificate.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(cert.refresh_time > now && cert.expiration_time > cert.refresh_time);
+}

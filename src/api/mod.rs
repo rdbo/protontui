@@ -76,7 +76,8 @@ pub struct ApiClient {
 }
 
 struct Inner {
-    http: reqwest::Client,
+    /// Replaced by [`ApiClient::reset_connections`]; clones share the connection pool.
+    http: RwLock<reqwest::Client>,
     base_url: String,
     locale: String,
     tokens: RwLock<Option<Tokens>>,
@@ -87,15 +88,9 @@ struct Inner {
 
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self, ApiError> {
-        let http = reqwest::Client::builder()
-            .user_agent(user_agent())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(ApiError::Network)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                http,
+                http: RwLock::new(http_client()?),
                 base_url: base_url.trim_end_matches('/').to_owned(),
                 locale: locale(),
                 tokens: RwLock::new(None),
@@ -103,6 +98,15 @@ impl ApiClient {
                 listener: RwLock::new(None),
             }),
         })
+    }
+
+    /// Drops pooled connections. Call after the host's routing changed (VPN up or down): a kept-alive
+    /// connection opened over the old path would otherwise hang until it times out.
+    pub fn reset_connections(&self) {
+        match http_client() {
+            Ok(client) => *self.inner.http.write().unwrap() = client,
+            Err(e) => tracing::warn!("rebuilding the HTTP client: {e}"),
+        }
     }
 
     pub fn base_url(&self) -> &str {
@@ -196,9 +200,8 @@ impl ApiClient {
         extra_headers: &[(&str, &str)],
     ) -> Result<RawResponse, ApiError> {
         let url = format!("{}/{}", self.inner.base_url, path.trim_start_matches('/'));
-        let mut request = self
-            .inner
-            .http
+        let http = self.inner.http.read().unwrap().clone();
+        let mut request = http
             .request(method, url)
             .header("x-pm-appversion", APP_VERSION)
             .header("x-pm-apiversion", API_VERSION)
@@ -348,6 +351,15 @@ fn error_from(response: &RawResponse) -> ApiError {
         CODE_OUTDATED_APP | CODE_OUTDATED_API => ApiError::AppVersionRejected(format!("{message} (code {code})")),
         _ => ApiError::Api { status, code, message, details: envelope.details },
     }
+}
+
+fn http_client() -> Result<reqwest::Client, ApiError> {
+    reqwest::Client::builder()
+        .user_agent(user_agent())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(ApiError::Network)
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {

@@ -135,6 +135,11 @@ pub fn remove_secret_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Seconds since the Unix epoch.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------------------
