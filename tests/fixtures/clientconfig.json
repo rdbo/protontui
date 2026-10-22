@@ -1,0 +1,85 @@
+{
+ "Code": 1000,
+ "DefaultPorts": {
+  "OpenVPN": {
+   "UDP": [
+    80,
+    51820,
+    4569,
+    1194,
+    5060
+   ],
+   "TCP": [
+    443,
+    7770,
+    8443
+   ]
+  },
+  "WireGuard": {
+   "UDP": [
+    443,
+    88,
+    1224,
+    51820,
+    500,
+    4500
+   ],
+   "TCP": [
+    443
+   ],
+   "TLS": [
+    443
+   ]
+  }
+ },
+ "HolesIPs": [
+  "62.112.9.168",
+  "104.245.144.186"
+ ],
+ "ServerRefreshInterval": 40,
+ "FeatureFlags": {
+  "NetShield": true,
+  "GuestHoles": false,
+  "ServerRefresh": true,
+  "StreamingServicesLogos": true,
+  "PortForwarding": true,
+  "ModerateNAT": true,
+  "SafeMode": false,
+  "StartConnectOnBoot": true,
+  "PollNotificationAPI": true,
+  "VpnAccelerator": true,
+  "SmartReconnect": true,
+  "PromoCode": false,
+  "WireGuardTls": true,
+  "Telemetry": true,
+  "NetShieldStats": true,
+  "BusinessEvents": false,
+  "ShowNewFreePlan": false
+ },
+ "SmartProtocol": {
+  "WireGuard": true,
+  "WireGuardTCP": true,
+  "WireGuardTLS": true,
+  "OpenVPN": false,
+  "OpenVPNTCP": false,
+  "IKEv2": false
+ },
+ "RatingSettings": {
+  "EligiblePlans": [
+   "vpn2022",
+   "vpn2024",
+   "bundle2022",
+   "family2022",
+   "duo2024",
+   "visionary2022",
+   "vpnpass2023"
+  ],
+  "SuccessConnections": 1,
+  "DaysLastReviewPassed": 30,
+  "DaysConnected": 3,
+  "DaysFromFirstConnection": 0
+ },
+ "ChangeServerAttemptLimit": 4,
+ "ChangeServerShortDelayInSeconds": 45,
+ "ChangeServerLongDelayInSeconds": 600
+}

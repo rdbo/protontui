@@ -130,6 +130,16 @@ impl ApiClient {
         self.post("auth/v4/2fa", &serde_json::json!({ "TwoFactorCode": code })).await
     }
 
+    /// `POST auth/v4/credentialless`: a guest session without an account (protoncore_android `performLoginLess`).
+    /// Must be sent with an unauthenticated session. `frame` is the challenge frame stored under `frame_name`.
+    ///
+    /// Tested 2026-10-21 (PLAN.md T1.6): rejected for Linux clients with 422 / code 5003 "Platform expected to be
+    /// in [Android, iOS]", for both `linux-vpn-protontui@…` and `linux-vpn-cli@…`, with any frame or none. The
+    /// server gates on the app-version platform, so guest mode is unavailable without posing as a mobile app.
+    pub async fn credentialless_session(&self, frame_name: &str, frame: &Value) -> Result<SessionResponse, ApiError> {
+        self.post("auth/v4/credentialless", &serde_json::json!({ "Payload": { frame_name: frame } })).await
+    }
+
     /// `DELETE auth`: revokes the current session on the server.
     pub async fn revoke_session(&self) -> Result<(), ApiError> {
         self.delete::<Value>("auth").await.map(|_| ())

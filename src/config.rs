@@ -66,6 +66,16 @@ impl Paths {
         self.state_dir.join("certificate.json")
     }
 
+    /// Cached server list (public data, T2.1).
+    pub fn servers_file(&self) -> PathBuf {
+        self.state_dir.join("servers.json")
+    }
+
+    /// Cached `vpn/v2/clientconfig` (T2.1).
+    pub fn client_config_file(&self) -> PathBuf {
+        self.state_dir.join("clientconfig.json")
+    }
+
     pub fn settings_file(&self) -> PathBuf {
         self.state_dir.join("settings.toml")
     }

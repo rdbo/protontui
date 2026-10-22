@@ -9,8 +9,10 @@ license = "GPL-3.0-or-later"
 anyhow = "1.0.104"
 base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
+ed25519-dalek = "2.2.0"
 futures = "0.3.34"
 nix = { version = "0.31.3", features = ["user", "fs"] }
+rand = "0.8.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2"] }
 rpassword = "7.5.4"
 rtnetlink = "0.23.0"
@@ -39,3 +41,13 @@ wiremock = "0.6.5"
 lto = true
 strip = true
 codegen-units = 1
+
+# Signature checks on the ~19k-server list (T2.2) take minutes with unoptimized crypto; optimize just those crates.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

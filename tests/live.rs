@@ -57,3 +57,108 @@ async fn auth_info_modulus_verifies() {
         auth.generate_proofs().unwrap();
     }
 }
+
+/// T1.6: guest sessions (`auth/v4/credentialless`) for this client identifying as itself. As of 2026-10-21 the API
+/// answers 5003 "Platform expected to be in [Android, iOS]". If this test starts failing, Proton opened guest
+/// mode to other platforms: revisit T1.6 in PLAN.md.
+#[tokio::test]
+async fn guest_session_is_mobile_only() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    let api = ApiClient::new(DEFAULT_BASE_URL).unwrap();
+    let session = api.create_unauth_session().await.unwrap();
+    api.set_tokens(Some(session.tokens()));
+    // True values where Linux has them; the Android-only fields neutral.
+    let frame = serde_json::json!({
+        "v": "2.0.7", "appLang": "en", "timezone": "UTC", "deviceName": 0, "regionCode": "",
+        "timezoneOffset": 0, "isJailbreak": false, "preferredContentSize": "", "storageCapacity": 0,
+        "isDarkmodeOn": false, "keyboards": []
+    });
+    let err = api.credentialless_session("vpn-linux-v4-challenge-0", &frame).await.unwrap_err();
+    eprintln!("credentialless: {err}");
+    assert!(matches!(err, protontui::api::ApiError::AppVersionRejected(ref m) if m.contains("Platform")), "{err:?}");
+}
+
+/// T2.1: a live fetch of the full server list. Logicals need a signed-in session, so this uses the stored one
+/// (`PROTONTUI_STATE_DIR`, as for the CLI); the server cache goes to a temporary directory.
+#[tokio::test]
+async fn live_server_list() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    use protontui::config::Paths;
+    use protontui::servers::cache::{self, Refresh};
+
+    let paths = Paths::detect().unwrap();
+    let Some(session) =
+        protontui::session::Session::restore(ApiClient::new(DEFAULT_BASE_URL).unwrap(), &paths).unwrap()
+    else {
+        eprintln!("skipped: not signed in (run `protontui login`)");
+        return;
+    };
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_paths = Paths::at(cache_dir.path());
+
+    let list = cache::refresh_servers(session.api(), &cache_paths, Refresh::IfStale).await.unwrap();
+    let (physical, countries) = (list.physical_count(), list.country_count());
+    eprintln!("{} logical, {physical} physical servers in {countries} countries", list.logicals.len());
+    assert!(physical > 10_000, "{physical} physical servers");
+    assert!(countries > 100, "{countries} countries");
+    assert_ne!(list.last_modified, protontui::api::servers::EPOCH_HTTP_DATE, "Last-Modified missing");
+
+    // The second, forced refresh is conditional: 304 plus loads.
+    let again = cache::refresh_servers(session.api(), &cache_paths, Refresh::Force).await.unwrap();
+    assert_eq!(again.logicals.len(), list.logicals.len());
+
+    let config = cache::client_config(session.api(), &cache_paths).await.unwrap();
+    eprintln!("WireGuard UDP ports: {:?}", config.default_ports.wireguard.udp);
+    assert!(!config.default_ports.wireguard.udp.is_empty());
+}
+
+/// T2.2: every live server's signature verifies, and the check is fast enough to run on each list download.
+#[tokio::test]
+async fn live_signatures_verify() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    use protontui::api::servers::Logicals;
+    use protontui::config::Paths;
+
+    let paths = Paths::detect().unwrap();
+    let Some(session) =
+        protontui::session::Session::restore(ApiClient::new(DEFAULT_BASE_URL).unwrap(), &paths).unwrap()
+    else {
+        eprintln!("skipped: not signed in (run `protontui login`)");
+        return;
+    };
+    let Logicals::Modified { response, .. } =
+        session.api().logicals(protontui::api::servers::EPOCH_HTTP_DATE, None).await.unwrap()
+    else {
+        panic!("unconditional fetch returned 304");
+    };
+    let mut logicals = response.logical_servers;
+    let total: usize = logicals.iter().map(|l| l.servers.len()).sum();
+    let started = std::time::Instant::now();
+    let dropped = protontui::servers::signature::retain_valid(&mut logicals);
+    eprintln!("{dropped} of {total} physical servers failed validation; took {:?}", started.elapsed());
+    assert_eq!(dropped, 0);
+
+    let list = protontui::servers::ServerList::build(&logicals, Default::default());
+    eprintln!("model: {} countries, {} logical servers", list.countries.len(), list.logicals.len());
+    assert!(list.countries.len() > 100);
+
+    // T2.3 on live data: Plus and Free selections.
+    use protontui::servers::{Intent, Request, select};
+    let settings = protontui::config::Settings::default();
+    let mut rng = rand::thread_rng();
+    for (tier, intent) in [(2, Intent::Fastest), (2, Intent::Country("CH".into())), (0, Intent::Fastest)] {
+        let selection = select(&list, &Request::new(intent.clone()), tier, &settings, &mut rng).unwrap();
+        let top: Vec<_> = selection.candidates.iter().take(3).map(|c| c.logical.name.as_str()).collect();
+        eprintln!("tier {tier} {intent:?}: {} candidates, best {top:?}", selection.candidates.len());
+        assert!(selection.candidates.iter().all(|c| c.logical.enabled && c.logical.tier <= tier));
+    }
+}
