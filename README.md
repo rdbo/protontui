@@ -6,7 +6,7 @@ official apps. It's one static binary with two roles: `protontui daemon` runs as
 `protontui` (the TUI and the CLI subcommands) runs as your user and talks to the daemon over
 `/run/protontui.sock`.
 
-Status: work in progress (see `../PLAN.md`). The CLI works; the TUI doesn't exist yet.
+Status: work in progress (see `../PLAN.md`). The TUI and the CLI work; packaging and hardening are next.
 
 ## Install
 
@@ -46,6 +46,12 @@ state (session, keys, certificate, settings) in `/var/lib/protontui`, readable b
 
 ## Use
 
+Run `protontui` with no arguments for the TUI: sign in, browse servers by country, city, Secure Core, P2P or
+Tor (`/` searches), Enter connects, `d` disconnects, `c` is Quick Connect, `f` adds a favourite, `s` and `a` open
+Settings and Account, `?` lists every key. Quitting the TUI leaves the connection up.
+
+The CLI does the same from scripts:
+
 ```sh
 protontui login                       # username, password, 2FA code
 protontui connect --country CH        # or --server CH#10, or --feature p2p; returns once connected
@@ -55,8 +61,25 @@ protontui disconnect
 protontui logout
 ```
 
+### Without an account
+
+Proton's "continue as guest" only works for its mobile apps, but a WireGuard config downloaded from
+account.proton.me (VPN → WireGuard configuration) connects without signing in, through the same tunnel, routing,
+DNS and kill switch:
+
+```sh
+protontui import ~/Downloads/wg-CH-45.conf   # or `i` in the TUI; stored 0600 in /var/lib/protontui/profiles
+protontui connect --config wg-CH-45
+protontui configs                            # list; `protontui remove-config NAME` deletes one
+```
+
+Such a connection has no API session, so the features (NetShield, Moderate NAT, …) are the ones chosen when
+the file was made, and there's no port forwarding or live feature change. Only full-tunnel configs
+(`AllowedIPs = 0.0.0.0/0`) are accepted; `PostUp`-style scripts are never run.
+
 The connection stays up when the CLI or TUI exits. If the network is ever left in a bad state (tunnel, routes,
 DNS or firewall), `doas protontui recover` removes everything protontui changed, including a permanent kill
 switch.
 
-For development, `--standalone` runs the engine in the CLI process itself (as root) instead of the daemon.
+For development, `--standalone` runs the engine in the CLI or TUI process itself (as root) instead of the
+daemon; quitting the standalone TUI disconnects. The TUI logs to `~/.local/state/protontui/protontui.log`.

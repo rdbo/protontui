@@ -16,8 +16,9 @@ use protontui::logging::{self, Role};
 use protontui::servers::select::{FeatureFilter, Intent, Request};
 use protontui::session::{self, AccountInfo, Authenticator, LoginError, LoginOutcome, Session};
 use protontui::vpn;
-use protontui::vpn::engine::{ConnectionState, Details, Engine, RuntimeState, ServerInfo};
+use protontui::vpn::engine::{ConnectionState, Details, Engine, RuntimeState, ServerInfo, Target};
 use protontui::vpn::killswitch;
+use protontui::vpn::wgconfig::{self, WgConfigSummary};
 
 /// Proton VPN for the terminal: sign in, browse servers, and connect the whole host over WireGuard.
 #[derive(Parser)]
@@ -47,7 +48,24 @@ enum Command {
         /// Only servers with this feature.
         #[arg(long, value_enum)]
         feature: Option<Feature>,
+        /// An imported WireGuard config (see `import`); needs no login.
+        #[arg(long, conflicts_with_all = ["country", "server", "feature"])]
+        config: Option<String>,
     },
+    /// Import a WireGuard .conf file (e.g. downloaded from account.proton.me) to connect without logging in.
+    Import {
+        file: std::path::PathBuf,
+        /// Name to store it under (default: the file name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace a config of the same name.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List the imported WireGuard configs.
+    Configs,
+    /// Delete an imported WireGuard config.
+    RemoveConfig { name: String },
     /// Switch to another server (Free plan: a random free server, with a cooldown).
     ChangeServer,
     /// Disconnect.
@@ -71,6 +89,18 @@ enum Command {
     },
     /// Emergency cleanup (as root): remove the kill switch, tunnel, routes and DNS changes.
     Recover,
+    /// Write a WireGuard .conf for a server from this host's own session keys (as root; for testing the
+    /// no-login path without downloading a config from account.proton.me).
+    #[command(hide = true)]
+    ExportConfig {
+        #[arg(long)]
+        country: Option<String>,
+        #[arg(long, conflicts_with = "country")]
+        server: Option<String>,
+        /// Where to write it (0600).
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
     /// Print the nftables scripts the kill switch would apply (for `nft -c -f -` checks).
     #[command(hide = true)]
     KillSwitchRules {
@@ -120,15 +150,22 @@ fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ExitCode> {
     let standalone = cli.standalone;
     match cli.command {
-        None => not_yet("the TUI", "T5.1"),
+        None => protontui::tui::run(standalone).await,
         Some(Command::Daemon) => {
             protontui::daemon::run(Paths::detect()?).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Connect { country, server, feature }) => {
-            let request = connect_request(country, server, feature);
-            if standalone { standalone::connect(request).await } else { connect(request).await }
+        Some(Command::Connect { config: Some(name), .. }) if standalone => {
+            standalone::connect(Target::WgConfig(name)).await
         }
+        Some(Command::Connect { config: Some(name), .. }) => connect_wg_config(name).await,
+        Some(Command::Connect { country, server, feature, config: None }) => {
+            let request = connect_request(country, server, feature);
+            if standalone { standalone::connect(Target::Proton(request)).await } else { connect(request).await }
+        }
+        Some(Command::Import { file, name, replace }) => import(standalone, file, name, replace).await,
+        Some(Command::Configs) => list_configs(standalone).await,
+        Some(Command::RemoveConfig { name }) => remove_config(standalone, name).await,
         Some(Command::ChangeServer) if standalone => bail!("change-server needs the daemon"),
         Some(Command::ChangeServer) => change_server().await,
         Some(Command::Disconnect) if standalone => standalone::disconnect().await,
@@ -141,17 +178,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Some(Command::Logout) => logout().await,
         Some(Command::Config { key, value }) => config(standalone, key, value).await,
         Some(Command::Recover) => recover().await,
+        Some(Command::ExportConfig { country, server, output }) => {
+            standalone::export_config(connect_request(country, server, None), output).await
+        }
         Some(Command::KillSwitchRules { allow_lan, ipv6, endpoint }) => {
             print!("{}", killswitch::ruleset(&killswitch::Rules { allow_lan, ipv6, endpoint, api: None }));
             print!("{}", killswitch::ipv6_leak_ruleset());
             Ok(ExitCode::SUCCESS)
         }
     }
-}
-
-fn not_yet(what: &str, task: &str) -> Result<ExitCode> {
-    eprintln!("{what} is not implemented yet ({task} in PLAN.md)");
-    Ok(ExitCode::from(2))
 }
 
 fn connect_request(country: Option<String>, server: Option<String>, feature: Option<Feature>) -> Request {
@@ -304,6 +339,9 @@ fn kill_switch_name(mode: KillSwitchMode) -> &'static str {
 }
 
 fn server_place(server: &ServerInfo) -> String {
+    if let Some(name) = &server.wg_config {
+        return format!("WireGuard config {name}");
+    }
     let country = protontui::servers::countries::country_name(&server.exit_country).unwrap_or(&server.exit_country);
     let mut place = if server.city.is_empty() { country.to_owned() } else { format!("{}, {country}", server.city) };
     if server.secure_core {
@@ -481,6 +519,77 @@ async fn follow_connection(
                 bail!("still not connected after {}s; see `protontui status`", CONNECT_TIMEOUT.as_secs());
             }
         }
+    }
+}
+
+async fn connect_wg_config(name: String) -> Result<ExitCode> {
+    let client = client().await?;
+    let mut events = client.events().context("event stream")?;
+    client.call(IpcRequest::Subscribe).await?;
+    client.call(IpcRequest::ConnectWgConfig { name }).await?;
+    follow_connection(&client, &mut events).await
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Imported WireGuard configs
+// ---------------------------------------------------------------------------------------------------------
+
+/// The store `--standalone` uses: this process's state directory.
+fn local_configs() -> Result<wgconfig::Store> {
+    Ok(wgconfig::Store::new(Paths::detect()?.profiles_dir()))
+}
+
+async fn import(standalone: bool, file: std::path::PathBuf, name: Option<String>, replace: bool) -> Result<ExitCode> {
+    let text = Zeroizing::new(std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?);
+    let name = name.unwrap_or_else(|| wgconfig::name_from_path(&file));
+    let configs = if standalone {
+        let config = local_configs()?.import(&name, &text, replace)?;
+        if !config.ignored.is_empty() {
+            eprintln!("warning: ignored {} (not supported)", config.ignored.join(", "));
+        }
+        local_configs()?.list()
+    } else {
+        let request = IpcRequest::ImportWgConfig { name: name.clone(), text: text.to_string(), replace };
+        match client().await?.call(request).await? {
+            Response::WgConfigs { configs } => configs,
+            other => bail!("unexpected answer from the daemon: {other:?}"),
+        }
+    };
+    println!("Imported {name}. Connect with `protontui connect --config {name}`.");
+    print_configs(&configs);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn list_configs(standalone: bool) -> Result<ExitCode> {
+    let configs = if standalone {
+        local_configs()?.list()
+    } else {
+        match client().await?.call(IpcRequest::ListWgConfigs).await? {
+            Response::WgConfigs { configs } => configs,
+            other => bail!("unexpected answer from the daemon: {other:?}"),
+        }
+    };
+    if configs.is_empty() {
+        println!("No WireGuard configs. Import one with `protontui import FILE`.");
+    }
+    print_configs(&configs);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn remove_config(standalone: bool, name: String) -> Result<ExitCode> {
+    if standalone {
+        local_configs()?.delete(&name)?;
+    } else {
+        client().await?.call(IpcRequest::DeleteWgConfig { name: name.clone() }).await?;
+    }
+    println!("Deleted {name}.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_configs(configs: &[WgConfigSummary]) {
+    for config in configs {
+        let server = config.server.as_deref().map(|s| format!(" ({s})")).unwrap_or_default();
+        println!("  {}{server}  {}{}", config.name, config.endpoint, if config.ipv6 { "  IPv6" } else { "" });
     }
 }
 
@@ -782,22 +891,24 @@ mod standalone {
 
     /// Runs a connection in the foreground until Ctrl-C, SIGTERM (`protontui --standalone disconnect`) or a
     /// fatal error.
-    pub async fn connect(request: Request) -> Result<ExitCode> {
+    pub async fn connect(target: Target) -> Result<ExitCode> {
         use tokio::signal::unix::{SignalKind, signal};
 
         if !nix::unistd::geteuid().is_root() {
             bail!("connecting changes the host network and needs root: run `doas protontui --standalone connect`");
         }
         let paths = Paths::detect()?;
-        let session = Session::restore(api_client()?, &paths)?.with_context(|| {
-            format!("not signed in (no session in {}); run `protontui --standalone login`", paths.state_dir.display())
-        })?;
+        let session = Session::restore(api_client()?, &paths)?;
+        if session.is_none() && matches!(target, Target::Proton(_)) {
+            bail!("not signed in (no session in {}); run `protontui --standalone login`", paths.state_dir.display());
+        }
 
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sigterm = signal(SignalKind::terminate())?;
-        let engine = Engine::start(Arc::new(session), paths.clone()).await?;
+        let engine = Engine::start(paths.clone()).await?;
+        engine.set_session(session.map(Arc::new));
         let mut events = engine.subscribe();
-        engine.connect(request).await?;
+        engine.connect_to(target).await?;
 
         let mut progress = Progress::new();
         loop {
@@ -883,6 +994,60 @@ mod standalone {
                 state.pid
             ),
         }
+    }
+
+    /// Builds a config the way account.proton.me does: this session's X25519 key (registered with Proton by
+    /// a current certificate), one server's key and endpoint, Proton's tunnel addresses and DNS.
+    pub async fn export_config(request: Request, output: std::path::PathBuf) -> Result<ExitCode> {
+        use base64::Engine as _;
+        use protontui::servers::cache::{self, Refresh};
+        use protontui::servers::model::{ServerList, Visibility};
+        use protontui::servers::{select, signature};
+        use protontui::vpn::keys::{self, CertificateFeatures, VpnKeys};
+
+        if !nix::unistd::geteuid().is_root() {
+            bail!("export-config reads the daemon's keys: run it with doas");
+        }
+        let paths = Paths::detect()?;
+        let session = Session::restore(api_client()?, &paths)?
+            .with_context(|| format!("not signed in (no session in {})", paths.state_dir.display()))?;
+        let settings = Settings::load(&paths.settings_file())?;
+        let tier = session.account().await.context("fetching account info")?.max_tier;
+        let keys = VpnKeys::load_or_generate(&paths.keys_file())?;
+        // The servers accept the key only while a certificate for it is valid.
+        let features = CertificateFeatures::from_settings(&settings, tier);
+        let certificate = keys::ensure_certificate(session.api(), &paths, &keys, features).await?;
+        let server_cache = cache::refresh_servers(session.api(), &paths, Refresh::IfStale).await?;
+        let list = ServerList::build(&server_cache.logicals, Visibility::default());
+        let selection = select::select(&list, &request, tier, &settings, &mut rand::thread_rng())?;
+        let candidate = selection.candidates[0];
+        let dto = server_cache.logicals.iter().flat_map(|l| &l.servers).find(|p| p.id == candidate.physical.id);
+        if let Some(Err(e)) = dto.map(signature::validate) {
+            bail!("{}: {e}", candidate.logical.name);
+        }
+        let client_config = cache::client_config(session.api(), &paths).await?;
+        let port = client_config.default_ports.wireguard.udp.first().copied().unwrap_or(51820);
+        let private_key = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(*keys.x25519_private()));
+        let text = Zeroizing::new(format!(
+            "[Interface]\n# Generated by protontui export-config from this host's session key\n\
+             PrivateKey = {}\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\n\
+             [Peer]\n# {}\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {}:{port}\n",
+            private_key.as_str(),
+            candidate.logical.name,
+            candidate.physical.x25519_public_key,
+            candidate.physical.entry_ip,
+        ));
+        protontui::config::write_atomic(&output, text.as_bytes(), 0o600)
+            .with_context(|| format!("writing {}", output.display()))?;
+        let valid_for = certificate.expiration_time.saturating_sub(protontui::config::unix_now());
+        println!(
+            "Wrote {} for {} ({}:{port}); usable while the certificate is valid ({}).",
+            output.display(),
+            candidate.logical.name,
+            candidate.physical.entry_ip,
+            format_duration(valid_for)
+        );
+        Ok(ExitCode::SUCCESS)
     }
 
     fn process_running(pid: u32) -> bool {

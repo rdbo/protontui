@@ -25,6 +25,7 @@ use crate::servers::select::{FeatureFilter, Request as ConnectRequest};
 use crate::session::AccountInfo;
 use crate::vpn::engine::{self, ConnectionState, Details, Stats};
 use crate::vpn::local_agent::NetShieldStats;
+use crate::vpn::wgconfig::WgConfigSummary;
 
 /// Where the daemon listens.
 pub const SOCKET_PATH: &str = "/run/protontui.sock";
@@ -70,6 +71,23 @@ pub enum Request {
     Status,
     /// Turns on [`ServerMessage::Event`]s for this client.
     Subscribe,
+    /// Stores a WireGuard `.conf` (its text) under `name`. Answered with [`Response::WgConfigs`].
+    ImportWgConfig {
+        name: String,
+        text: String,
+        /// Replace a config of the same name.
+        #[serde(default)]
+        replace: bool,
+    },
+    /// Answered with [`Response::WgConfigs`].
+    ListWgConfigs,
+    DeleteWgConfig {
+        name: String,
+    },
+    /// Connects with an imported WireGuard config; works signed out.
+    ConnectWgConfig {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +104,10 @@ pub enum Response {
         settings: Settings,
     },
     Status(Box<Status>),
+    /// The imported WireGuard configs (never their keys).
+    WgConfigs {
+        configs: Vec<WgConfigSummary>,
+    },
     Error(IpcError),
 }
 

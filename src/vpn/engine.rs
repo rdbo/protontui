@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::api::servers::{ClientConfig, DeviceLocation};
+use crate::api::servers::DeviceLocation;
+use crate::api::{self, ApiClient};
 use crate::config::{self, KillSwitchMode, Paths, Settings};
 use crate::servers::cache::{self, Refresh};
 use crate::servers::model::{ServerList, Visibility};
@@ -35,6 +36,7 @@ use crate::session::Session;
 use crate::vpn::keys::{self, CertificateFeatures, StoredCertificate, VpnKeys};
 use crate::vpn::killswitch::{self, Rules};
 use crate::vpn::local_agent::{self, Agent, AgentEvent, AgentParams, NetShieldStats};
+use crate::vpn::wgconfig;
 use crate::vpn::wireguard::{self, INTERFACE, Peer, PeerStats, Tunnel, TunnelConfig};
 use crate::vpn::{dns, routing};
 
@@ -75,6 +77,10 @@ pub struct ServerInfo {
     pub domain: String,
     /// "Bouncing" label for the local agent.
     pub label: String,
+    /// Set for a connection from an imported WireGuard config (T5.7): its name. Only `name`, `entry_ip` and
+    /// `port` mean anything then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wg_config: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +330,15 @@ async fn teardown_host(
     if errors.is_empty() { Ok(actions) } else { Err(anyhow!(errors.join("; "))) }
 }
 
+/// What to connect to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A Proton server picked from the server list; needs a session.
+    Proton(Request),
+    /// An imported WireGuard config, by name (no session needed).
+    WgConfig(String),
+}
+
 /// The connection engine. Cheap to clone; clones share the connection.
 #[derive(Clone)]
 pub struct Engine {
@@ -331,7 +346,8 @@ pub struct Engine {
 }
 
 struct Inner {
-    session: Arc<Session>,
+    /// The signed-in session, if any. A connection keeps the one it started with.
+    session: std::sync::RwLock<Option<Arc<Session>>>,
     paths: Paths,
     state: watch::Sender<ConnectionState>,
     events: broadcast::Sender<Event>,
@@ -347,8 +363,8 @@ struct Running {
 }
 
 impl Engine {
-    /// Cleans up after a crashed run if needed, then returns an idle engine. Needs root.
-    pub async fn start(session: Arc<Session>, paths: Paths) -> Result<Self> {
+    /// Cleans up after a crashed run if needed, then returns an idle engine without a session. Needs root.
+    pub async fn start(paths: Paths) -> Result<Self> {
         // Without root there's nothing this process could clean (or connect); development runs get this far.
         if nix::unistd::geteuid().is_root() {
             for action in cleanup_stale().await? {
@@ -358,13 +374,28 @@ impl Engine {
         let (state, _) = watch::channel(ConnectionState::Disconnected);
         let (events, _) = broadcast::channel(256);
         let (settings, _) = watch::channel(None);
-        let inner =
-            Inner { session, paths, state, events, details: Default::default(), settings, running: Mutex::new(None) };
+        let inner = Inner {
+            session: Default::default(),
+            paths,
+            state,
+            events,
+            details: Default::default(),
+            settings,
+            running: Mutex::new(None),
+        };
         Ok(Self { inner: Arc::new(inner) })
     }
 
-    pub fn session(&self) -> &Arc<Session> {
-        &self.inner.session
+    /// The signed-in session, if any.
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.inner.session()
+    }
+
+    /// Signs the engine in or out. A running connection keeps its own session until it ends.
+    pub fn set_session(&self, session: Option<Arc<Session>>) {
+        if let Ok(mut current) = self.inner.session.write() {
+            *current = session;
+        }
     }
 
     /// The latest stats, location, forwarded port and NetShield counters of the current connection.
@@ -384,14 +415,23 @@ impl Engine {
         self.inner.events.subscribe()
     }
 
-    /// Starts connecting (replacing any current connection) and returns; progress arrives as events.
+    /// Starts connecting to a Proton server (replacing any current connection) and returns; progress arrives
+    /// as events.
     pub async fn connect(&self, request: Request) -> Result<()> {
+        if self.session().is_none() {
+            bail!("not signed in");
+        }
+        self.connect_to(Target::Proton(request)).await
+    }
+
+    /// Like [`Engine::connect`], for a [`Target`].
+    pub async fn connect_to(&self, target: Target) -> Result<()> {
         self.disconnect().await?;
         let mut running = self.inner.running.lock().await;
         let (cancel, cancelled) = watch::channel(false);
         let inner = self.inner.clone();
         inner.set_state(ConnectionState::Connecting { server: None });
-        let task = tokio::spawn(run_connection(inner, request, cancelled));
+        let task = tokio::spawn(run_connection(inner, target, cancelled));
         *running = Some(Running { cancel, task });
         Ok(())
     }
@@ -425,6 +465,10 @@ impl Engine {
 }
 
 impl Inner {
+    fn session(&self) -> Option<Arc<Session>> {
+        self.session.read().ok().and_then(|s| s.clone())
+    }
+
     fn set_state(&self, state: ConnectionState) {
         tracing::info!("state: {}", describe(&state));
         if !state.is_active()
@@ -533,9 +577,21 @@ impl Connection {
 /// Everything a connection attempt needs, gathered before touching the network.
 struct Prepared {
     settings: Settings,
+    /// The session of an API connection; `None` for an imported config.
+    session: Option<Arc<Session>>,
+    /// The session's client, or an anonymous one (only `vpn/location`).
+    api: ApiClient,
     tier: u8,
-    keys: VpnKeys,
-    client_config: ClientConfig,
+    /// The account's keys (certificate, local agent); `None` for an imported config.
+    keys: Option<VpnKeys>,
+    /// WireGuard's private key.
+    private_key: zeroize::Zeroizing<[u8; 32]>,
+    /// UDP ports to try, in order.
+    ports: Vec<u16>,
+    /// Tunnel addresses.
+    addresses: Vec<(IpAddr, u8)>,
+    /// Resolvers when custom DNS is off.
+    dns: Vec<IpAddr>,
     /// Best first; `port` is still 0.
     candidates: Vec<ServerInfo>,
     /// X25519 keys of the candidates, in the same order.
@@ -546,10 +602,11 @@ struct Prepared {
     ipv6: bool,
 }
 
-async fn run_connection(inner: Arc<Inner>, request: Request, mut cancelled: watch::Receiver<bool>) {
+async fn run_connection(inner: Arc<Inner>, target: Target, mut cancelled: watch::Receiver<bool>) {
     let mut connection = None;
+    let session = inner.session();
     let outcome = tokio::select! {
-        result = connect_and_monitor(&inner, &request, &mut connection) => result,
+        result = connect_and_monitor(&inner, &target, &mut connection) => result,
         _ = cancelled.changed() => Ok(()),
     };
     if let Err(e) = &outcome {
@@ -570,7 +627,9 @@ async fn run_connection(inner: Arc<Inner>, request: Request, mut cancelled: watc
         None => Ok(()),
     };
     // The session's HTTP connections went through the tunnel; don't reuse them.
-    inner.session.api().reset_connections();
+    if let Some(session) = session {
+        session.api().reset_connections();
+    }
     let final_state = match (outcome, teardown) {
         (Ok(()), Ok(())) => ConnectionState::Disconnected,
         (Err(e), Ok(())) => ConnectionState::Error { reason: format!("{e:#}") },
@@ -585,26 +644,32 @@ async fn run_connection(inner: Arc<Inner>, request: Request, mut cancelled: watc
     inner.set_state(final_state);
 }
 
-async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option<Connection>) -> Result<()> {
+async fn connect_and_monitor(inner: &Inner, target: &Target, slot: &mut Option<Connection>) -> Result<()> {
     let settings = Settings::load(&inner.paths.settings_file())?;
     // Changes from now on reach the monitor loop.
     let mut settings_changes = inner.settings.subscribe();
     let connection = slot.insert(Connection::new(KillSwitchRecord::from(&settings))?);
-    if settings.kill_switch == KillSwitchMode::Permanent {
-        // The permanent kill switch blocks the API too; open a hole for it until the tunnel is up.
-        let base_url = inner.session.api().base_url().to_owned();
-        let host = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_owned));
-        let host = host.with_context(|| format!("no host in the API URL {base_url}"))?;
-        killswitch::open_api_window(&connection.record.kill_switch.idle_rules(), &host)
-            .await
-            .context("letting the API through the permanent kill switch")?;
-    }
-    let mut prepared = prepare(inner, request, settings).await?;
+    let mut prepared = match target {
+        Target::Proton(request) => {
+            let session = inner.session().context("not signed in")?;
+            if settings.kill_switch == KillSwitchMode::Permanent {
+                // The permanent kill switch blocks the API too; open a hole for it until the tunnel is up.
+                let base_url = session.api().base_url().to_owned();
+                let host = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_owned));
+                let host = host.with_context(|| format!("no host in the API URL {base_url}"))?;
+                killswitch::open_api_window(&connection.record.kill_switch.idle_rules(), &host)
+                    .await
+                    .context("letting the API through the permanent kill switch")?;
+            }
+            prepare(inner, session, request, settings).await?
+        }
+        Target::WgConfig(name) => prepare_wg_config(inner, name, settings).await?,
+    };
     let (agent_events_tx, mut agent_events) = mpsc::unbounded_channel();
     let (mut index, mut server) = establish(inner, &prepared, connection, 0).await?;
 
     // DNS
-    let servers = dns_servers(&prepared.settings, inner).await;
+    let servers = dns_servers(&prepared, inner);
     let backend = dns::Backend::detect().await;
     let ifindex = connection.tunnel.as_ref().map(Tunnel::index);
     // Recorded before applying, so a crash halfway still gets reverted.
@@ -620,9 +685,9 @@ async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option
         r.server = Some(server.clone());
         r.connected_since = Some(since);
     });
-    inner.session.api().reset_connections();
+    prepared.api.reset_connections();
     inner.set_state(ConnectionState::Connected { server: server.clone(), since });
-    spawn_location_fetch(inner);
+    spawn_location_fetch(inner, &prepared.api);
 
     // Monitor until something fails beyond repair; cancellation ends it from outside.
     loop {
@@ -642,9 +707,9 @@ async fn connect_and_monitor(inner: &Inner, request: &Request, slot: &mut Option
         (index, server) = establish(inner, &prepared, connection, index).await?;
         connection.settle_kill_switch(endpoint_of(&server), prepared.ipv6).await?;
         start_agent(inner, &prepared, connection, &server, &agent_events_tx);
-        inner.session.api().reset_connections();
+        prepared.api.reset_connections();
         inner.set_state(ConnectionState::Connected { server: server.clone(), since });
-        spawn_location_fetch(inner);
+        spawn_location_fetch(inner, &prepared.api);
     }
 }
 
@@ -664,6 +729,8 @@ fn start_agent(
     if inner.details.lock().is_ok_and(|d| d.forwarded_port.is_some()) {
         inner.emit(Event::PortForward(None));
     }
+    // An imported config has no API certificate, so no agent.
+    let Some(keys) = &prepared.keys else { return };
     let certificate = match StoredCertificate::load(&inner.paths.certificate_file()) {
         Ok(Some(certificate)) => certificate,
         Ok(None) => {
@@ -677,7 +744,7 @@ fn start_agent(
     };
     let params = AgentParams {
         domain: server.domain.clone(),
-        key_pem: prepared.keys.ed25519_private_pem(),
+        key_pem: keys.ed25519_private_pem(),
         certificate_pem: certificate.certificate,
     };
     let features = local_agent::features_for(&prepared.settings, prepared.tier, &server.label);
@@ -685,10 +752,10 @@ fn start_agent(
 }
 
 /// Loads account, client config and servers, and the certificate; picks the candidates.
-async fn prepare(inner: &Inner, request: &Request, settings: Settings) -> Result<Prepared> {
+async fn prepare(inner: &Inner, session: Arc<Session>, request: &Request, settings: Settings) -> Result<Prepared> {
     let paths = &inner.paths;
-    let api = inner.session.api();
-    let account = inner.session.account().await.context("fetching account info")?;
+    let api = session.api();
+    let account = session.account().await.context("fetching account info")?;
     let tier = account.max_tier;
 
     let keys = VpnKeys::load_or_generate(&paths.keys_file())?;
@@ -738,6 +805,7 @@ async fn prepare(inner: &Inner, request: &Request, settings: Settings) -> Result
             port: 0,
             domain: physical.domain.clone(),
             label: physical.label.clone(),
+            wg_config: None,
         });
         peer_keys.push(key);
     }
@@ -746,7 +814,67 @@ async fn prepare(inner: &Inner, request: &Request, settings: Settings) -> Result
     }
     let best = list.by_id(&candidates[0].logical_id).context("candidate vanished from the list")?;
     let ipv6 = settings.ipv6 && best.features.ipv6();
-    Ok(Prepared { settings, tier, keys, client_config, candidates, peer_keys, ipv6 })
+    let mut ports: Vec<u16> = client_config.default_ports.wireguard.udp.clone();
+    if ports.is_empty() {
+        ports.push(DEFAULT_WIREGUARD_PORT);
+    }
+    ports.truncate(MAX_PORTS_PER_SERVER);
+    Ok(Prepared {
+        settings,
+        api: api.clone(),
+        session: Some(session.clone()),
+        tier,
+        private_key: keys.x25519_private(),
+        keys: Some(keys),
+        ports,
+        addresses: TunnelConfig::proton_addresses(ipv6),
+        dns: vec![IpAddr::V4(wireguard::SERVER_ADDRESS_V4)],
+        candidates,
+        peer_keys,
+        ipv6,
+    })
+}
+
+/// Loads an imported WireGuard config: one server, one port, its own key, addresses and DNS.
+async fn prepare_wg_config(inner: &Inner, name: &str, settings: Settings) -> Result<Prepared> {
+    let config = wgconfig::Store::new(inner.paths.profiles_dir()).load(name)?;
+    if !config.ignored.is_empty() {
+        tracing::info!("WireGuard config {name}: ignoring {}", config.ignored.join(", "));
+    }
+    let endpoint = config.endpoint.resolve().await?;
+    let ipv6 = settings.ipv6 && config.ipv6;
+    let addresses = config.addresses.iter().copied().filter(|(ip, _)| ip.is_ipv4() || ipv6).collect();
+    let dns: Vec<IpAddr> = config.dns.iter().copied().filter(|ip| ip.is_ipv4() || ipv6).collect();
+    let server = ServerInfo {
+        name: config.server.clone().unwrap_or_else(|| name.to_owned()),
+        logical_id: String::new(),
+        physical_id: String::new(),
+        exit_country: String::new(),
+        entry_country: String::new(),
+        city: String::new(),
+        secure_core: false,
+        tier: 0,
+        load: 0,
+        entry_ip: *endpoint.ip(),
+        port: 0,
+        domain: String::new(),
+        label: String::new(),
+        wg_config: Some(name.to_owned()),
+    };
+    Ok(Prepared {
+        settings,
+        session: None,
+        api: ApiClient::new(api::DEFAULT_BASE_URL)?,
+        tier: 0,
+        keys: None,
+        private_key: config.private_key,
+        ports: vec![endpoint.port()],
+        addresses,
+        dns: if dns.is_empty() { vec![IpAddr::V4(wireguard::SERVER_ADDRESS_V4)] } else { dns },
+        candidates: vec![server],
+        peer_keys: vec![config.peer_public_key],
+        ipv6,
+    })
 }
 
 /// Brings the tunnel up with the first candidate (from `start`, wrapping around) that completes a handshake.
@@ -758,23 +886,20 @@ async fn establish(
     connection: &mut Connection,
     start: usize,
 ) -> Result<(usize, ServerInfo)> {
-    let mut ports: Vec<u16> = prepared.client_config.default_ports.wireguard.udp.clone();
-    if ports.is_empty() {
-        ports.push(DEFAULT_WIREGUARD_PORT);
-    }
     let count = prepared.candidates.len();
     let mut last_error = None;
     for offset in 0..count {
         let index = (start + offset) % count;
         let mut server = prepared.candidates[index].clone();
-        for &port in ports.iter().take(MAX_PORTS_PER_SERVER) {
+        for &port in &prepared.ports {
             server.port = port;
             inner.set_state(ConnectionState::Connecting { server: Some(server.clone()) });
             let config = TunnelConfig {
-                private_key: prepared.keys.x25519_private(),
+                private_key: prepared.private_key.clone(),
                 peer: Peer { public_key: prepared.peer_keys[index], endpoint: SocketAddr::V4(endpoint_of(&server)) },
                 fwmark: routing::FWMARK,
                 ipv6: prepared.ipv6,
+                addresses: prepared.addresses.clone(),
             };
             match try_server(connection, &config, endpoint_of(&server)).await {
                 Ok(()) => {
@@ -904,9 +1029,12 @@ async fn monitor(
                 }
             }
             _ = certificate_check.tick() => {
-                let features = CertificateFeatures::from_settings(&prepared.settings, tier_of(inner).await);
-                if let Err(e) = keys::ensure_certificate(inner.session.api(), &inner.paths, &prepared.keys, features).await {
-                    tracing::warn!("refreshing the certificate: {e:#}");
+                if let (Some(session), Some(keys)) = (&prepared.session, &prepared.keys) {
+                    let tier = session.account().await.map(|a| a.max_tier).unwrap_or(prepared.tier);
+                    let features = CertificateFeatures::from_settings(&prepared.settings, tier);
+                    if let Err(e) = keys::ensure_certificate(session.api(), &inner.paths, keys, features).await {
+                        tracing::warn!("refreshing the certificate: {e:#}");
+                    }
                 }
             }
             Some(event) = agent_events.recv() => match event {
@@ -926,10 +1054,11 @@ async fn monitor(
                         )));
                         continue;
                     }
+                    let (Some(session), Some(keys)) = (prepared.session.clone(), prepared.keys.as_ref()) else { continue };
                     tracing::warn!("the local agent rejected the certificate ({reason}); requesting a new one");
                     certificate_renewed_at = Some(Instant::now());
                     let features = CertificateFeatures::from_settings(&prepared.settings, prepared.tier);
-                    match keys::request_certificate(inner.session.api(), &prepared.keys, features).await {
+                    match keys::request_certificate(session.api(), keys, features).await {
                         Ok(certificate) => {
                             if let Err(e) = certificate.save(&inner.paths.certificate_file()) {
                                 tracing::warn!("saving the certificate: {e:#}");
@@ -975,10 +1104,6 @@ async fn apply_live_settings(
     if old.ipv6 != settings.ipv6 || old.custom_dns != settings.custom_dns {
         inner.emit(Event::Warning("IPv6 and DNS changes apply at the next connection: reconnect to apply".into()));
     }
-}
-
-async fn tier_of(inner: &Inner) -> u8 {
-    inner.session.account().await.map(|a| a.max_tier).unwrap_or(0)
 }
 
 struct AbortOnDrop(JoinHandle<()>);
@@ -1043,19 +1168,20 @@ fn rates(stats: &PeerStats, previous: Option<&(PeerStats, Instant)>) -> Stats {
     }
 }
 
-/// Proton's resolver inside the tunnel, or the custom list when enabled.
-async fn dns_servers(settings: &Settings, inner: &Inner) -> Vec<IpAddr> {
+/// Proton's resolver inside the tunnel (or the imported config's), or the custom list when enabled.
+fn dns_servers(prepared: &Prepared, inner: &Inner) -> Vec<IpAddr> {
+    let settings = &prepared.settings;
     if settings.custom_dns.enabled && !settings.custom_dns.servers.is_empty() {
-        if settings.netshield_for_tier(tier_of(inner).await) != config::NetShield::Off {
+        if prepared.session.is_some() && settings.netshield_for_tier(prepared.tier) != config::NetShield::Off {
             inner.emit(Event::Warning("NetShield only works with Proton DNS; custom DNS servers bypass it".into()));
         }
         return settings.custom_dns.servers.clone();
     }
-    vec![IpAddr::V4(wireguard::SERVER_ADDRESS_V4)]
+    prepared.dns.clone()
 }
 
-fn spawn_location_fetch(inner: &Inner) {
-    let api = inner.session.api().clone();
+fn spawn_location_fetch(inner: &Inner, api: &ApiClient) {
+    let api = api.clone();
     let events = inner.events.clone();
     let details = inner.details.clone();
     tokio::spawn(async move {

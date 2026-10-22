@@ -42,6 +42,9 @@ x509-parser = "0.16.0"
 # Proton's own crates, used as path dependencies (see PLAN.md §1).
 proton-srp = { path = "../proton-crypto-rs/proton-srp" }
 local-agent-rs = { path = "../python-proton-vpn-local-agent/local_agent_rs" }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+fuzzy-matcher = "0.3.7"
 
 [dev-dependencies]
 curve25519-dalek = "4.1.3"

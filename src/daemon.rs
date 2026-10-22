@@ -8,6 +8,12 @@
 //! With a permanent kill switch and no connection, the API is unreachable too. Requests that need it (login,
 //! logout, the server list) open the same temporary hole the engine uses while connecting
 //! ([`killswitch::open_api_window`]) and close it afterwards.
+//!
+//! The engine exists for the daemon's whole life; signing in attaches a session to it. Imported WireGuard
+//! configs (T5.7) connect without one.
+//!
+//! [`Daemon::start`] + [`Daemon::spawn_background`] also run in-process for `protontui --standalone` (the TUI
+//! talks to it over an in-memory pipe instead of the socket).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -28,8 +34,9 @@ use crate::servers::countries;
 use crate::servers::model::{Features, ServerList, Visibility};
 use crate::servers::select::{self, ChangeServerAttempts, ChangeServerPolicy, Intent};
 use crate::session::{Authenticator, LoginError, LoginOutcome, Session};
-use crate::vpn::engine::{self, ConnectionState, Engine};
+use crate::vpn::engine::{self, ConnectionState, Engine, Target};
 use crate::vpn::killswitch;
+use crate::vpn::wgconfig;
 
 /// How many recent targets are kept.
 pub const MAX_RECENTS: usize = 10;
@@ -39,25 +46,26 @@ const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(15);
 
 pub struct Daemon {
     paths: Paths,
+    engine: Engine,
     events: broadcast::Sender<Event>,
-    state: Mutex<State>,
+    /// A login waiting for its 2FA code.
+    login: Mutex<Option<(ApiClient, Authenticator)>>,
     /// Server summaries built from the cache, and the cache's fetch times they came from.
     servers: Mutex<Option<BuiltSummaries>>,
     /// Serializes requests that open the API window through a permanent kill switch.
     api_window: Mutex<()>,
+    /// Forwards engine events to the clients.
+    forwarder: JoinHandle<()>,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
 }
 
 /// Summaries and the `(logicals_fetched_at, loads_fetched_at)` of the cache they were built from.
 type BuiltSummaries = (Arc<Vec<ServerSummary>>, (u64, u64));
-
-#[derive(Default)]
-struct State {
-    /// Present while signed in.
-    engine: Option<Engine>,
-    forwarder: Option<JoinHandle<()>>,
-    /// A login waiting for its 2FA code.
-    login: Option<(ApiClient, Authenticator)>,
-}
 
 fn api_client() -> Result<ApiClient> {
     Ok(ApiClient::new(api::DEFAULT_BASE_URL)?)
@@ -75,37 +83,13 @@ pub async fn run(paths: Paths) -> Result<()> {
         tracing::warn!("running without root: only the API side works");
     }
     tracing::info!("daemon starting (protontui {})", env!("CARGO_PKG_VERSION"));
-    if nix::unistd::geteuid().is_root() {
-        for action in engine::cleanup_stale().await? {
-            tracing::info!("startup cleanup: {action}");
-        }
-    }
-    let settings = Settings::load(&paths.settings_file())?;
-    if let Err(e) = engine::apply_idle_kill_switch(&settings).await {
-        tracing::error!("kill switch at start: {e:#}");
-    }
-    if settings.kill_switch == KillSwitchMode::Permanent {
-        tracing::info!("permanent kill switch armed");
-    }
-
-    let (events, _) = broadcast::channel(512);
-    let daemon = Arc::new(Daemon {
-        paths: paths.clone(),
-        events,
-        state: Mutex::new(State::default()),
-        servers: Mutex::new(None),
-        api_window: Mutex::new(()),
-    });
-    if let Some(session) = Session::restore(api_client()?, &paths)? {
-        tracing::info!("restored the session of {}", session.username());
-        daemon.install_session(session).await?;
-    }
+    let daemon = Daemon::start(paths).await?;
 
     let socket = ipc::socket_path();
     let listener = ipc::bind(&socket)?;
     tracing::info!("listening on {}", socket.display());
 
-    let background = tokio::spawn(background(daemon.clone()));
+    let background = daemon.spawn_background();
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let result = tokio::select! {
@@ -115,12 +99,7 @@ pub async fn run(paths: Paths) -> Result<()> {
     };
     tracing::info!("daemon stopping");
     background.abort();
-    let engine = daemon.state.lock().await.engine.clone();
-    if let Some(engine) = engine
-        && let Err(e) = engine.disconnect().await
-    {
-        tracing::error!("disconnecting at shutdown: {e:#}");
-    }
+    daemon.shutdown().await;
     let _ = std::fs::remove_file(&socket);
     result
 }
@@ -160,6 +139,10 @@ fn request_name(request: &Request) -> &'static str {
         Request::SetSettings { .. } => "set settings",
         Request::Status => "status",
         Request::Subscribe => "subscribe",
+        Request::ImportWgConfig { .. } => "import config",
+        Request::ListWgConfigs => "list configs",
+        Request::DeleteWgConfig { .. } => "delete config",
+        Request::ConnectWgConfig { .. } => "connect config",
     }
 }
 
@@ -168,31 +151,91 @@ fn not_signed_in() -> anyhow::Error {
 }
 
 impl Daemon {
+    /// Cleans up after a crashed connection, puts the kill switch in its idle state (re-arming a permanent
+    /// one) and restores the stored session. Root, except for development runs (API side only).
+    pub async fn start(paths: Paths) -> Result<Arc<Self>> {
+        if nix::unistd::geteuid().is_root() {
+            for action in engine::cleanup_stale().await? {
+                tracing::info!("startup cleanup: {action}");
+            }
+        }
+        let settings = Settings::load(&paths.settings_file())?;
+        if let Err(e) = engine::apply_idle_kill_switch(&settings).await {
+            tracing::error!("kill switch at start: {e:#}");
+        }
+        if settings.kill_switch == KillSwitchMode::Permanent {
+            tracing::info!("permanent kill switch armed");
+        }
+
+        let engine = Engine::start(paths.clone()).await?;
+        let (events, _) = broadcast::channel(512);
+        let mut engine_events = engine.subscribe();
+        let forward = events.clone();
+        let forwarder = tokio::spawn(async move {
+            loop {
+                match engine_events.recv().await {
+                    Ok(event) => {
+                        let _ = forward.send(event.into());
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        let daemon = Arc::new(Daemon {
+            paths: paths.clone(),
+            engine,
+            events,
+            login: Mutex::new(None),
+            servers: Mutex::new(None),
+            api_window: Mutex::new(()),
+            forwarder,
+        });
+        if let Some(session) = Session::restore(api_client()?, &paths)? {
+            tracing::info!("restored the session of {}", session.username());
+            daemon.install_session(session);
+        }
+        Ok(daemon)
+    }
+
+    /// Auto-connect, then the periodic server list refresh. Abort the handle to stop it.
+    pub fn spawn_background(self: &Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(background(self.clone()))
+    }
+
+    /// Disconnects (a permanent kill switch stays).
+    pub async fn shutdown(&self) {
+        if let Err(e) = self.engine.disconnect().await {
+            tracing::error!("disconnecting at shutdown: {e:#}");
+        }
+    }
+
     async fn dispatch(&self, request: Request) -> Result<Response> {
         match request {
             Request::Login { username, password } => self.login(username, Zeroizing::new(password)).await,
             Request::Submit2Fa { code } => self.submit_2fa(code).await,
             Request::Logout => self.logout().await,
             Request::GetAccount => {
-                let account = match self.engine().await {
-                    Some(engine) => Some(self.with_api(engine.session().account()).await?),
+                let account = match self.session() {
+                    Some(session) => Some(self.with_api(session.account()).await?),
                     None => None,
                 };
                 Ok(Response::Account { account })
             }
             Request::ListServers { filter } => self.list_servers(filter).await.map(Response::Servers),
             Request::Connect(request) => {
-                let engine = self.engine().await.ok_or_else(not_signed_in)?;
+                self.session().ok_or_else(not_signed_in)?;
                 self.remember(&request.intent)?;
-                engine.connect(request).await?;
+                self.engine.connect(request).await?;
                 Ok(Response::Ok)
             }
             Request::ChangeServer => self.change_server().await,
             Request::Disconnect => {
-                match self.engine().await {
-                    Some(engine) => engine.disconnect().await?,
-                    // Signed out: nothing runs, but a kill switch may be left from before.
-                    None => engine::apply_idle_kill_switch(&self.settings()?).await?,
+                self.engine.disconnect().await?;
+                // Nothing may have run, but a kill switch can be left from before (a failed connection of an
+                // earlier daemon, a setting changed by hand).
+                if !self.engine.state().is_active() {
+                    engine::apply_idle_kill_switch(&self.settings()?).await?;
                 }
                 Ok(Response::Ok)
             }
@@ -200,15 +243,39 @@ impl Daemon {
             Request::SetSettings { settings } => {
                 settings.save(&self.paths.settings_file())?;
                 let _ = self.events.send(Event::SettingsChanged { settings: settings.clone() });
-                match self.engine().await {
-                    Some(engine) => engine.apply_settings(settings).await,
-                    None => engine::apply_idle_kill_switch(&settings).await,
-                }
-                .context("the settings are saved, but applying them failed")?;
+                self.engine
+                    .apply_settings(settings)
+                    .await
+                    .context("the settings are saved, but applying them failed")?;
                 Ok(Response::Ok)
             }
             Request::Status => self.status().await.map(|s| Response::Status(Box::new(s))),
             Request::Subscribe => Ok(Response::Ok),
+            Request::ImportWgConfig { name, text, replace } => {
+                let text = Zeroizing::new(text);
+                let config = self.wg_configs().import(&name, &text, replace).map_err(invalid)?;
+                tracing::info!("imported WireGuard config {name} ({})", config.endpoint);
+                if !config.ignored.is_empty() {
+                    let message = format!("{name}: ignored {} (not supported)", config.ignored.join(", "));
+                    let _ = self.events.send(Event::Warning { message });
+                }
+                Ok(Response::WgConfigs { configs: self.wg_configs().list() })
+            }
+            Request::ListWgConfigs => Ok(Response::WgConfigs { configs: self.wg_configs().list() }),
+            Request::DeleteWgConfig { name } => {
+                let state = self.engine.state();
+                if state.is_active() && state.server().and_then(|s| s.wg_config.as_deref()) == Some(name.as_str()) {
+                    return Err(IpcError::new(ErrorKind::InvalidRequest, "disconnect before deleting it").into());
+                }
+                self.wg_configs().delete(&name).map_err(invalid)?;
+                Ok(Response::WgConfigs { configs: self.wg_configs().list() })
+            }
+            Request::ConnectWgConfig { name } => {
+                // Fails early on a bad name; the engine loads it again when connecting.
+                self.wg_configs().load(&name).map_err(invalid)?;
+                self.engine.connect_to(Target::WgConfig(name)).await?;
+                Ok(Response::Ok)
+            }
         }
     }
 
@@ -216,46 +283,26 @@ impl Daemon {
         Settings::load(&self.paths.settings_file())
     }
 
-    async fn engine(&self) -> Option<Engine> {
-        self.state.lock().await.engine.clone()
+    fn session(&self) -> Option<Arc<Session>> {
+        self.engine.session()
     }
 
-    /// Starts an engine for `session` and forwards its events to the clients.
-    async fn install_session(&self, session: Session) -> Result<()> {
+    fn wg_configs(&self) -> wgconfig::Store {
+        wgconfig::Store::new(self.paths.profiles_dir())
+    }
+
+    /// Signs the engine in.
+    fn install_session(&self, session: Session) {
         let username = session.username().to_owned();
-        let engine = Engine::start(Arc::new(session), self.paths.clone()).await?;
-        let mut engine_events = engine.subscribe();
-        let events = self.events.clone();
-        let forwarder = tokio::spawn(async move {
-            loop {
-                match engine_events.recv().await {
-                    Ok(event) => {
-                        let _ = events.send(event.into());
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-        });
-        let mut state = self.state.lock().await;
-        if let Some(old) = state.forwarder.replace(forwarder) {
-            old.abort();
-        }
-        state.engine = Some(engine);
-        drop(state);
+        self.engine.set_session(Some(Arc::new(session)));
         let _ = self.events.send(Event::SessionChanged { username: Some(username) });
-        Ok(())
     }
 
     /// Runs `f`, which needs the API. With a permanent kill switch and nothing connected, the API is let
     /// through for that time.
     async fn with_api<T>(&self, f: impl Future<Output = T>) -> T {
         let settings = self.settings().unwrap_or_default();
-        let idle = match self.engine().await {
-            Some(engine) => !engine.state().is_active(),
-            None => true,
-        };
-        if settings.kill_switch != KillSwitchMode::Permanent || !idle {
+        if settings.kill_switch != KillSwitchMode::Permanent || self.engine.state().is_active() {
             return f.await;
         }
         let _window = self.api_window.lock().await;
@@ -266,18 +313,16 @@ impl Daemon {
         }
         let result = f.await;
         // Close it again, unless a connection started meanwhile and owns the kill switch now.
-        let still_idle = match self.engine().await {
-            Some(engine) => !engine.state().is_active(),
-            None => true,
-        };
-        if still_idle && let Err(e) = engine::apply_idle_kill_switch(&self.settings().unwrap_or(settings)).await {
+        if !self.engine.state().is_active()
+            && let Err(e) = engine::apply_idle_kill_switch(&self.settings().unwrap_or(settings)).await
+        {
             tracing::error!("re-arming the permanent kill switch: {e:#}");
         }
         result
     }
 
     async fn login(&self, username: String, password: Zeroizing<String>) -> Result<Response> {
-        if self.engine().await.is_some() {
+        if self.session().is_some() {
             return Err(IpcError::new(ErrorKind::AlreadySignedIn, "already signed in; log out first").into());
         }
         let api = api_client()?;
@@ -290,14 +335,14 @@ impl Daemon {
                 self.finish_login(session).await
             }
             LoginOutcome::Need2Fa { totp, fido2 } => {
-                self.state.lock().await.login = Some((api, auth));
+                *self.login.lock().await = Some((api, auth));
                 Ok(Response::Login(LoginReply::Need2Fa { totp, fido2 }))
             }
         }
     }
 
     async fn submit_2fa(&self, code: String) -> Result<Response> {
-        let Some((api, mut auth)) = self.state.lock().await.login.take() else {
+        let Some((api, mut auth)) = self.login.lock().await.take() else {
             return Err(login_error(LoginError::NoPendingLogin));
         };
         match self.with_api(auth.submit_totp(code.trim())).await {
@@ -308,7 +353,7 @@ impl Daemon {
             Err(e) => {
                 // A wrong code may be retried.
                 if matches!(e, LoginError::WrongTwoFactorCode) {
-                    self.state.lock().await.login = Some((api, auth));
+                    *self.login.lock().await = Some((api, auth));
                 }
                 Err(login_error(e))
             }
@@ -324,27 +369,20 @@ impl Daemon {
                 None
             }
         };
-        self.install_session(session).await?;
+        self.install_session(session);
         *self.servers.lock().await = None;
         Ok(Response::Login(LoginReply::Done { account }))
     }
 
     async fn logout(&self) -> Result<Response> {
-        let (engine, forwarder) = {
-            let mut state = self.state.lock().await;
-            state.login = None;
-            (state.engine.take(), state.forwarder.take())
-        };
-        let Some(engine) = engine else {
+        *self.login.lock().await = None;
+        let Some(session) = self.session() else {
             crate::session::wipe(&self.paths)?;
             return Ok(Response::Ok);
         };
-        engine.disconnect().await?;
-        let session = engine.session().clone();
-        drop(engine);
-        if let Some(forwarder) = forwarder {
-            forwarder.abort();
-        }
+        // An imported config's connection doesn't need the session, but the user is leaving: end it too.
+        self.engine.disconnect().await?;
+        self.engine.set_session(None);
         self.with_api(session.logout()).await?;
         tracing::info!("signed out {}", session.username());
         *self.servers.lock().await = None;
@@ -354,18 +392,16 @@ impl Daemon {
 
     async fn status(&self) -> Result<Status> {
         let settings = self.settings()?;
-        let engine = self.engine().await;
-        let (username, state, details) = match &engine {
-            Some(engine) => (Some(engine.session().username().to_owned()), engine.state(), engine.details()),
-            None => (None, ConnectionState::Disconnected, Default::default()),
-        };
-        let change_server_in = match &engine {
-            Some(engine) => match engine.session().account().await {
+        let session = self.session();
+        let (state, details) = (self.engine.state(), self.engine.details());
+        let change_server_in = match &session {
+            Some(session) => match session.account().await {
                 Ok(account) if account.max_tier == 0 => self.change_server_wait()?.as_secs(),
                 _ => 0,
             },
             None => 0,
         };
+        let username = session.map(|s| s.username().to_owned());
         Ok(Status {
             username,
             state,
@@ -411,10 +447,10 @@ impl Daemon {
     }
 
     async fn change_server(&self) -> Result<Response> {
-        let engine = self.engine().await.ok_or_else(not_signed_in)?;
-        let tier = engine.session().account().await?.max_tier;
+        let session = self.session().ok_or_else(not_signed_in)?;
+        let tier = session.account().await?.max_tier;
         let mut request = select::Request::new(Intent::Random);
-        if let Some(server) = engine.state().server() {
+        if let Some(server) = self.engine.state().server().filter(|s| s.wg_config.is_none()) {
             request = request.excluding(server.logical_id.clone());
         }
         if tier == 0 {
@@ -429,13 +465,12 @@ impl Daemon {
             let attempts = self.change_server_policy().register(&self.change_server_attempts(), config::unix_now());
             config::write_atomic(&self.paths.change_server_file(), &serde_json::to_vec(&attempts)?, 0o644)?;
         }
-        engine.connect(request).await?;
+        self.engine.connect(request).await?;
         Ok(Response::Ok)
     }
 
     async fn list_servers(&self, filter: ServerFilter) -> Result<ServerListing> {
-        let engine = self.engine().await.ok_or_else(not_signed_in)?;
-        let session = engine.session().clone();
+        let session = self.session().ok_or_else(not_signed_in)?;
         let user_tier = match session.account().await {
             Ok(account) => account.max_tier,
             Err(_) => 0,
@@ -510,9 +545,10 @@ impl Daemon {
     }
 
     async fn auto_connect(&self) {
-        let Some(engine) = self.engine().await else {
+        if self.session().is_none() {
             return;
-        };
+        }
+        let engine = &self.engine;
         let settings = self.settings().unwrap_or_default();
         let intent = match &settings.auto_connect {
             AutoConnect::Off => return,
@@ -557,16 +593,16 @@ impl Daemon {
 
     /// Refreshes the server list (loads every 15 min, full list every 3 h) while the API is reachable.
     async fn refresh_servers(&self) {
-        let Some(engine) = self.engine().await else {
+        let Some(session) = self.session() else {
             return;
         };
         let settings = self.settings().unwrap_or_default();
-        if settings.kill_switch == KillSwitchMode::Permanent && !engine.state().is_active() {
+        if settings.kill_switch == KillSwitchMode::Permanent && !self.engine.state().is_active() {
             // Not worth opening the firewall every 15 minutes; the next connection refreshes.
             return;
         }
         let before = ServerCache::load(&self.paths.servers_file()).map(|c| (c.logicals_fetched_at, c.loads_fetched_at));
-        match cache::refresh_servers(engine.session().api(), &self.paths, Refresh::IfStale).await {
+        match cache::refresh_servers(session.api(), &self.paths, Refresh::IfStale).await {
             Ok(cache) => {
                 if before != Some((cache.logicals_fetched_at, cache.loads_fetched_at)) {
                     tracing::info!("server list refreshed ({} servers)", cache.logicals.len());
@@ -587,6 +623,11 @@ async fn background(daemon: Arc<Daemon>) {
         refresh.tick().await;
         daemon.refresh_servers().await;
     }
+}
+
+/// A request the daemon can't carry out as asked (bad config, unknown name).
+fn invalid(error: anyhow::Error) -> anyhow::Error {
+    IpcError::new(ErrorKind::InvalidRequest, format!("{error:#}")).into()
 }
 
 /// Maps login failures to IPC error kinds, with the human verification URL when there is one.
@@ -610,4 +651,49 @@ fn login_error(error: LoginError) -> anyhow::Error {
         _ => ErrorKind::Failed,
     };
     IpcError::new(kind, error.to_string()).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ipc::Handler;
+
+    const CONFIG: &str = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.2.0.2/32\n\
+                          [Peer]\n# CH#45\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\n\
+                          AllowedIPs = 0.0.0.0/0\nEndpoint = 198.51.100.7:51820\n";
+
+    fn kind(response: Response) -> Option<ErrorKind> {
+        match response {
+            Response::Error(e) => Some(e.kind),
+            _ => None,
+        }
+    }
+
+    /// Signed out, the daemon still imports, lists and deletes WireGuard configs; Proton requests say why not.
+    #[tokio::test]
+    async fn signed_out_wg_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start(Paths::at(dir.path())).await.unwrap();
+
+        let Response::Status(status) = daemon.handle(Request::Status).await else { panic!() };
+        assert_eq!((status.username, status.state), (None, ConnectionState::Disconnected));
+        let connect = Request::Connect(select::Request::new(Intent::Fastest));
+        assert_eq!(kind(daemon.handle(connect).await), Some(ErrorKind::NotSignedIn));
+        assert_eq!(daemon.handle(Request::GetAccount).await, Response::Account { account: None });
+
+        let import =
+            |name: &str, text: &str| Request::ImportWgConfig { name: name.into(), text: text.into(), replace: false };
+        let Response::WgConfigs { configs } = daemon.handle(import("ch45", CONFIG)).await else { panic!() };
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].server.as_deref(), Some("CH#45"));
+        assert_eq!(kind(daemon.handle(import("ch45", CONFIG)).await), Some(ErrorKind::InvalidRequest));
+        assert_eq!(kind(daemon.handle(import("bad", "nope")).await), Some(ErrorKind::InvalidRequest));
+        assert_eq!(kind(daemon.handle(import("../x", CONFIG)).await), Some(ErrorKind::InvalidRequest));
+        let unknown = Request::ConnectWgConfig { name: "nope".into() };
+        assert_eq!(kind(daemon.handle(unknown).await), Some(ErrorKind::InvalidRequest));
+
+        let delete = Request::DeleteWgConfig { name: "ch45".into() };
+        assert_eq!(daemon.handle(delete).await, Response::WgConfigs { configs: vec![] });
+        assert_eq!(daemon.handle(Request::ListWgConfigs).await, Response::WgConfigs { configs: vec![] });
+    }
 }

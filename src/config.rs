@@ -85,6 +85,11 @@ impl Paths {
         self.state_dir.join("change_server.json")
     }
 
+    /// Imported WireGuard configs (T5.7; secret: they hold private keys).
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.state_dir.join("profiles")
+    }
+
     /// Everything tied to a signed-in account, removed by logout.
     pub fn account_bound_files(&self) -> [PathBuf; 4] {
         [self.session_file(), self.account_file(), self.keys_file(), self.certificate_file()]
@@ -243,7 +248,7 @@ pub enum AutoConnect {
 }
 
 /// Something the user can connect to; used by favourites, recents and auto-connect.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ConnectTarget {
     Fastest,

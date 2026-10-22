@@ -9,6 +9,7 @@ pub mod keys;
 pub mod killswitch;
 pub mod local_agent;
 pub mod routing;
+pub mod wgconfig;
 pub mod wireguard;
 
 use std::path::Path;

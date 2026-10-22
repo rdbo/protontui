@@ -81,13 +81,17 @@ pub struct TunnelConfig {
     pub peer: Peer,
     /// Firewall mark on the encrypted UDP packets, so policy routing can exempt them (T3.3).
     pub fwmark: u32,
+    /// Whether IPv6 goes through the tunnel (routing blackholes it otherwise).
     pub ipv6: bool,
+    /// Tunnel addresses: [`TunnelConfig::proton_addresses`], or an imported config's.
+    pub addresses: Vec<(IpAddr, u8)>,
 }
 
 impl TunnelConfig {
-    fn addresses(&self) -> Vec<(IpAddr, u8)> {
+    /// The addresses every Proton WireGuard server hands out.
+    pub fn proton_addresses(ipv6: bool) -> Vec<(IpAddr, u8)> {
         let mut addresses = vec![(IpAddr::V4(ADDRESS_V4), 32)];
-        if self.ipv6 {
+        if ipv6 {
             addresses.push((IpAddr::V6(ADDRESS_V6), 128));
         }
         addresses
@@ -161,7 +165,7 @@ impl Tunnel {
         self.set_device(config).await.context("configuring WireGuard")?;
         let rt = &self.rt;
         rt.link().set(LinkUnspec::new_with_index(self.index).mtu(MTU).build()).execute().await?;
-        for (address, prefix) in config.addresses() {
+        for &(address, prefix) in &config.addresses {
             rt.address()
                 .add(self.index, address, prefix)
                 .replace()
