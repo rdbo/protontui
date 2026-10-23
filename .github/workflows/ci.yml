@@ -1,0 +1,85 @@
+# fmt, clippy (with and without the local agent), tests, and the static musl release builds, on every push.
+#
+# Runs in rust:alpine, like development: a rustup toolchain on a musl host, so `.cargo/config.toml`'s static
+# x86_64-unknown-linux-musl target builds and tests natively. aarch64 is cross-built with cargo-zigbuild.
+# Proton's local_agent_rs isn't vendored (no license); scripts/fetch-local-agent.sh puts it where Cargo.toml
+# expects it, next to the checkout.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: rust:1-alpine
+    steps:
+      - name: Build dependencies
+        run: apk add --no-cache musl-dev cmake make perl git curl tar
+      - uses: actions/checkout@v4
+        with:
+          path: protontui
+      - name: Fetch local_agent_rs
+        run: sh protontui/scripts/fetch-local-agent.sh
+      - name: Toolchain components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protontui
+      - name: fmt
+        working-directory: protontui
+        run: cargo fmt --check
+      - name: clippy
+        working-directory: protontui
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: clippy (without the local agent)
+        working-directory: protontui
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+      - name: test
+        working-directory: protontui
+        run: cargo test --locked
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    container: rust:1-alpine
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    env:
+      # The artifacts are downloadable, so they're built without the unlicensed local_agent_rs (PLAN.md
+      # T6.4): NetShield, VPN Accelerator and Moderate NAT still apply through the certificate; port
+      # forwarding, NetShield statistics and live feature changes need a local build with default features.
+      FEATURES: --no-default-features
+    steps:
+      - name: Build dependencies
+        run: apk add --no-cache musl-dev cmake make perl git curl tar file zig
+      - uses: actions/checkout@v4
+        with:
+          path: protontui
+      - name: Fetch local_agent_rs
+        run: sh protontui/scripts/fetch-local-agent.sh
+      - name: Target and cargo-zigbuild
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo install cargo-zigbuild --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: protontui
+          key: ${{ matrix.target }}
+      - name: Build
+        working-directory: protontui
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} $FEATURES
+      - name: Check it's static
+        working-directory: protontui
+        run: |
+          file target/${{ matrix.target }}/release/protontui
+          file target/${{ matrix.target }}/release/protontui | grep -Eq "static(-pie)? linked|statically linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: protontui-${{ matrix.target }}
+          path: protontui/target/${{ matrix.target }}/release/protontui

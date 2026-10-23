@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::config::ConnectTarget;
+use crate::config::{ConnectTarget, Destination, Profile};
 use crate::ipc::{ServerListing, ServerSummary};
 use crate::servers::countries::country_name;
 use crate::servers::model::Features;
@@ -27,13 +27,23 @@ pub enum Tab {
     Tor,
     Favourites,
     Recents,
+    /// Named profiles (T6.2).
+    Profiles,
     /// Imported WireGuard configs (T5.7).
     Configs,
 }
 
 impl Tab {
-    pub const SIGNED_IN: [Tab; 7] =
-        [Tab::Countries, Tab::SecureCore, Tab::P2P, Tab::Tor, Tab::Favourites, Tab::Recents, Tab::Configs];
+    pub const SIGNED_IN: [Tab; 8] = [
+        Tab::Countries,
+        Tab::SecureCore,
+        Tab::P2P,
+        Tab::Tor,
+        Tab::Favourites,
+        Tab::Recents,
+        Tab::Profiles,
+        Tab::Configs,
+    ];
     /// Without a session only imported configs can connect.
     pub const SIGNED_OUT: [Tab; 1] = [Tab::Configs];
 
@@ -45,6 +55,7 @@ impl Tab {
             Tab::Tor => "Tor",
             Tab::Favourites => "Favourites",
             Tab::Recents => "Recents",
+            Tab::Profiles => "Profiles",
             Tab::Configs => "Configs",
         }
     }
@@ -58,6 +69,7 @@ impl Tab {
             Tab::Tor => "Tor",
             Tab::Favourites => "Fav",
             Tab::Recents => "Rec",
+            Tab::Profiles => "Prof",
             Tab::Configs => "Conf",
         }
     }
@@ -206,7 +218,9 @@ pub enum Row {
         server: usize,
         depth: u8,
     },
-    Target(ConnectTarget),
+    Target(Destination),
+    /// Index into the settings' profiles.
+    Profile(usize),
     Config(usize),
     /// Text only (empty tab, loading, signed out).
     Note(String),
@@ -218,7 +232,8 @@ enum RowKey {
     Country(String),
     City(String, String),
     Server(String),
-    Target(ConnectTarget),
+    Target(Destination),
+    Profile(String),
     Config(String),
     Note,
 }
@@ -228,6 +243,7 @@ enum RowKey {
 pub enum Action {
     Connect(Request),
     ConnectConfig(String),
+    ConnectProfile(String),
 }
 
 pub struct Browser {
@@ -261,8 +277,9 @@ impl Default for Browser {
 /// What a rebuild draws from.
 pub struct Sources<'a> {
     pub index: Option<&'a ServerIndex>,
-    pub favourites: &'a [ConnectTarget],
-    pub recents: &'a [ConnectTarget],
+    pub favourites: &'a [Destination],
+    pub recents: &'a [Destination],
+    pub profiles: &'a [Profile],
     pub configs: &'a [WgConfigSummary],
     pub signed_in: bool,
 }
@@ -310,6 +327,25 @@ impl Browser {
                         "No recent connections."
                     };
                     return vec![Row::Note(hint.into())];
+                }
+                rows
+            }
+            Tab::Profiles => {
+                let rows: Vec<Row> = sources
+                    .profiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        query.is_empty()
+                            || p.name.to_lowercase().contains(&query)
+                            || target_label(&p.target, sources.index).to_lowercase().contains(&query)
+                    })
+                    .map(|(i, _)| Row::Profile(i))
+                    .collect();
+                if rows.is_empty() && query.is_empty() {
+                    return vec![Row::Note(
+                        "No profiles yet. Press p on a country, city or server to save it as one.".into(),
+                    )];
                 }
                 rows
             }
@@ -518,7 +554,12 @@ impl Browser {
     }
 
     /// What Enter on the selected row does.
-    pub fn action(&self, index: Option<&ServerIndex>, configs: &[WgConfigSummary]) -> Option<Action> {
+    pub fn action(
+        &self,
+        index: Option<&ServerIndex>,
+        profiles: &[Profile],
+        configs: &[WgConfigSummary],
+    ) -> Option<Action> {
         let row = self.selected_row()?;
         let feature = match self.tab {
             Tab::P2P => Some(FeatureFilter::P2P),
@@ -540,25 +581,50 @@ impl Browser {
                 Request { intent, feature, exclude: None }
             }
             Row::Server { server, .. } => Request::new(Intent::Server(index?.servers[*server].name.clone())),
-            Row::Target(target) => Request::new(Intent::from(target)),
+            Row::Target(destination) => match &destination.target {
+                ConnectTarget::Profile { name } => return Some(Action::ConnectProfile(name.clone())),
+                _ => Request::for_destination(destination)?,
+            },
+            Row::Profile(i) => return Some(Action::ConnectProfile(profiles.get(*i)?.name.clone())),
             Row::Config(i) => return Some(Action::ConnectConfig(configs.get(*i)?.name.clone())),
             Row::Note(_) => return None,
         };
         Some(Action::Connect(request))
     }
 
-    /// The favourite `f` adds or removes for the selected row.
-    pub fn favourite_target(&self, index: Option<&ServerIndex>) -> Option<ConnectTarget> {
-        Some(match self.selected_row()? {
-            Row::Country { country, .. } => ConnectTarget::Country { code: index?.countries[*country].code.clone() },
+    /// What the selected row stands for, as favourites and profiles store it: with the tab's feature (P2P,
+    /// Tor), and a country in the Secure Core tab as Secure Core into it.
+    pub fn destination(&self, index: Option<&ServerIndex>, profiles: &[Profile]) -> Option<Destination> {
+        self.row_destination(self.selected_row()?, index, profiles)
+    }
+
+    /// [`Browser::destination`] for any row of the current tab.
+    pub fn row_destination(&self, row: &Row, index: Option<&ServerIndex>, profiles: &[Profile]) -> Option<Destination> {
+        let feature = match self.tab {
+            Tab::P2P => Some(FeatureFilter::P2P),
+            Tab::Tor => Some(FeatureFilter::Tor),
+            _ => None,
+        };
+        let target = match row {
+            Row::Country { country, .. } => {
+                let code = index?.countries[*country].code.clone();
+                match self.tab {
+                    Tab::SecureCore => ConnectTarget::SecureCore { exit: Some(code), entry: None },
+                    _ => ConnectTarget::Country { code },
+                }
+            }
             Row::City { country, city, .. } => {
                 let country = &index?.countries[*country];
                 ConnectTarget::City { country: country.code.clone(), city: country.cities[*city].name.clone() }
             }
-            Row::Server { server, .. } => ConnectTarget::Server { name: index?.servers[*server].name.clone() },
-            Row::Target(target) => target.clone(),
+            Row::Server { server, .. } => {
+                return Some(ConnectTarget::Server { name: index?.servers[*server].name.clone() }.into());
+            }
+            Row::Target(destination) => return Some(destination.clone()),
+            Row::Profile(i) => return Some(ConnectTarget::Profile { name: profiles.get(*i)?.name.clone() }.into()),
             Row::Config(_) | Row::Note(_) => return None,
-        })
+        };
+        Some(Destination { target, feature })
     }
 }
 
@@ -577,24 +643,40 @@ fn key(row: &Row, sources: &Sources) -> RowKey {
         },
         Row::Server { server, .. } => RowKey::Server(index.map(|i| i.servers[*server].id.clone()).unwrap_or_default()),
         Row::Target(target) => RowKey::Target(target.clone()),
+        Row::Profile(i) => RowKey::Profile(sources.profiles.get(*i).map(|p| p.name.clone()).unwrap_or_default()),
         Row::Config(i) => RowKey::Config(sources.configs.get(*i).map(|c| c.name.clone()).unwrap_or_default()),
         Row::Note(_) => RowKey::Note,
     }
 }
 
-/// How a favourite or recent reads: "Switzerland", "Zurich, Switzerland", "CH#10".
-pub fn target_label(target: &ConnectTarget, index: Option<&ServerIndex>) -> String {
+/// How a favourite, recent or profile target reads: "Switzerland", "Zurich, Switzerland · P2P", "CH#10",
+/// "Secure Core → Japan via Sweden", "Profile work".
+pub fn target_label(destination: &Destination, index: Option<&ServerIndex>) -> String {
     let country = |code: &str| {
         index
             .and_then(|i| i.country(code).map(|c| c.name.clone()))
             .or_else(|| country_name(code).map(str::to_owned))
             .unwrap_or_else(|| code.to_owned())
     };
-    match target {
+    let label = match &destination.target {
         ConnectTarget::Fastest => "Fastest server".into(),
         ConnectTarget::Country { code } => country(code),
         ConnectTarget::City { country: code, city } => format!("{city}, {}", country(code)),
         ConnectTarget::Server { name } => name.clone(),
+        ConnectTarget::SecureCore { exit, entry } => {
+            let mut label = format!("Secure Core → {}", exit.as_deref().map_or("fastest".into(), country));
+            if let Some(entry) = entry {
+                label.push_str(&format!(" via {}", country(entry)));
+            }
+            label
+        }
+        ConnectTarget::Profile { name } => format!("Profile {name}"),
+    };
+    match destination.feature {
+        Some(FeatureFilter::P2P) => format!("{label} · P2P"),
+        Some(FeatureFilter::Tor) => format!("{label} · Tor"),
+        Some(FeatureFilter::Streaming) => format!("{label} · streaming"),
+        None => label,
     }
 }
 
@@ -630,8 +712,8 @@ mod tests {
         ServerIndex::build(ServerListing { user_tier, servers, updated_at: 0 })
     }
 
-    fn sources<'a>(index: &'a ServerIndex, favourites: &'a [ConnectTarget]) -> Sources<'a> {
-        Sources { index: Some(index), favourites, recents: &[], configs: &[], signed_in: true }
+    fn sources<'a>(index: &'a ServerIndex, favourites: &'a [Destination]) -> Sources<'a> {
+        Sources { index: Some(index), favourites, recents: &[], profiles: &[], configs: &[], signed_in: true }
     }
 
     fn names(browser: &Browser, index: &ServerIndex) -> Vec<String> {
@@ -645,6 +727,7 @@ mod tests {
                 Row::City { country, city, .. } => format!(" {}", index.countries[*country].cities[*city].name),
                 Row::Server { server, .. } => format!("  {}", index.servers[*server].name),
                 Row::Target(t) => target_label(t, Some(index)),
+                Row::Profile(i) => format!("profile {i}"),
                 Row::Config(i) => format!("config {i}"),
                 Row::Note(n) => n.clone(),
             })
@@ -696,29 +779,34 @@ mod tests {
         browser.set_tab(Tab::SecureCore);
         browser.rebuild(&sources(&index, &[]));
         assert_eq!(names(&browser, &index), ["+JP", "+CH"]);
-        let Some(Action::Connect(request)) = browser.action(Some(&index), &[]) else { panic!() };
+        let Some(Action::Connect(request)) = browser.action(Some(&index), &[], &[]) else { panic!() };
         assert_eq!(request.intent, Intent::SecureCore { exit: Some("JP".into()), entry: None });
 
         browser.set_tab(Tab::P2P);
         browser.rebuild(&sources(&index, &[]));
         assert_eq!(names(&browser, &index), ["+CH"]);
-        let Some(Action::Connect(request)) = browser.action(Some(&index), &[]) else { panic!() };
+        let Some(Action::Connect(request)) = browser.action(Some(&index), &[], &[]) else { panic!() };
         assert_eq!((request.intent, request.feature), (Intent::Country("CH".into()), Some(FeatureFilter::P2P)));
         browser.expand(&index, Some(true));
         browser.rebuild(&sources(&index, &[]));
         browser.move_by(1);
-        let Some(Action::Connect(request)) = browser.action(Some(&index), &[]) else { panic!() };
+        let Some(Action::Connect(request)) = browser.action(Some(&index), &[], &[]) else { panic!() };
         assert_eq!(request.intent, Intent::Server("CH#2".into()));
-        assert_eq!(browser.favourite_target(Some(&index)), Some(ConnectTarget::Server { name: "CH#2".into() }));
+        assert_eq!(browser.destination(Some(&index), &[]), Some(ConnectTarget::Server { name: "CH#2".into() }.into()));
+        browser.move_by(-1);
+        let p2p =
+            Destination { target: ConnectTarget::Country { code: "CH".into() }, feature: Some(FeatureFilter::P2P) };
+        assert_eq!(browser.destination(Some(&index), &[]), Some(p2p.clone()));
+        assert_eq!(target_label(&p2p, Some(&index)), "Switzerland · P2P");
 
-        let favourites = [ConnectTarget::City { country: "CH".into(), city: "Zurich".into() }];
+        let favourites = [ConnectTarget::City { country: "CH".into(), city: "Zurich".into() }.into()];
         browser.set_tab(Tab::Favourites);
         browser.rebuild(&sources(&index, &favourites));
         assert_eq!(names(&browser, &index), ["Zurich, Switzerland"]);
         browser.set_tab(Tab::Recents);
         browser.rebuild(&sources(&index, &favourites));
         assert!(browser.selected_row().is_none(), "a note can't be selected");
-        assert_eq!(browser.action(Some(&index), &[]), None);
+        assert_eq!(browser.action(Some(&index), &[], &[]), None);
     }
 
     #[test]
@@ -769,10 +857,11 @@ mod tests {
         let configs =
             [WgConfigSummary { name: "home".into(), server: None, endpoint: "1.2.3.4:51820".into(), ipv6: false }];
         let mut browser = Browser::default();
-        let sources = Sources { index: None, favourites: &[], recents: &[], configs: &configs, signed_in: false };
+        let sources =
+            Sources { index: None, favourites: &[], recents: &[], profiles: &[], configs: &configs, signed_in: false };
         browser.rebuild(&sources);
         assert_eq!(browser.tab, Tab::Configs);
-        assert_eq!(browser.action(None, &configs), Some(Action::ConnectConfig("home".into())));
+        assert_eq!(browser.action(None, &[], &configs), Some(Action::ConnectConfig("home".into())));
     }
 
     /// The real list has ~18k servers; a keystroke must stay well under a frame.

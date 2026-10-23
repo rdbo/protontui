@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::api::{self, ApiClient, ApiError};
-use crate::config::{self, AutoConnect, ConnectTarget, KillSwitchMode, Paths, Settings};
+use crate::config::{self, AutoConnect, ConnectTarget, Destination, KillSwitchMode, Paths, Settings};
 use crate::ipc::{
     self, ErrorKind, Event, IpcError, LoginReply, Request, Response, ServerFilter, ServerListing, ServerSummary, Status,
 };
@@ -33,16 +33,18 @@ use crate::servers::cache::{self, CachedClientConfig, Refresh, ServerCache};
 use crate::servers::countries;
 use crate::servers::model::{Features, ServerList, Visibility};
 use crate::servers::select::{self, ChangeServerAttempts, ChangeServerPolicy, Intent};
-use crate::session::{Authenticator, LoginError, LoginOutcome, Session};
+use crate::session::{AccountInfo, Authenticator, LoginError, LoginOutcome, Session};
 use crate::vpn::engine::{self, ConnectionState, Engine, Target};
 use crate::vpn::killswitch;
-use crate::vpn::wgconfig;
+use crate::vpn::{wgconfig, wireguard};
 
 /// How many recent targets are kept.
 pub const MAX_RECENTS: usize = 10;
 /// Auto-connect retries (the network may not be up yet at boot), and the pause between them.
 const AUTO_CONNECT_ATTEMPTS: u32 = 5;
 const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(15);
+/// How long auto-connect waits for a default route first.
+const NETWORK_WAIT: Duration = Duration::from_secs(120);
 
 pub struct Daemon {
     paths: Paths,
@@ -143,6 +145,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::ListWgConfigs => "list configs",
         Request::DeleteWgConfig { .. } => "delete config",
         Request::ConnectWgConfig { .. } => "connect config",
+        Request::ConnectProfile { .. } => "connect profile",
     }
 }
 
@@ -154,20 +157,20 @@ impl Daemon {
     /// Cleans up after a crashed connection, puts the kill switch in its idle state (re-arming a permanent
     /// one) and restores the stored session. Root, except for development runs (API side only).
     pub async fn start(paths: Paths) -> Result<Arc<Self>> {
-        if nix::unistd::geteuid().is_root() {
-            for action in engine::cleanup_stale().await? {
-                tracing::info!("startup cleanup: {action}");
-            }
-        }
+        // Cleans up after a crashed connection first (as root).
+        let engine = Engine::start(paths.clone()).await?;
         let settings = Settings::load(&paths.settings_file())?;
-        if let Err(e) = engine::apply_idle_kill_switch(&settings).await {
+        api::alternative::set_enabled(settings.alternative_routing);
+        if let ConnectionState::Error { reason } = engine.state() {
+            // The crashed connection's kill switch stays until the user connects or disconnects.
+            tracing::warn!("{reason}");
+        } else if let Err(e) = engine::apply_idle_kill_switch(&settings).await {
             tracing::error!("kill switch at start: {e:#}");
         }
         if settings.kill_switch == KillSwitchMode::Permanent {
             tracing::info!("permanent kill switch armed");
         }
 
-        let engine = Engine::start(paths.clone()).await?;
         let (events, _) = broadcast::channel(512);
         let mut engine_events = engine.subscribe();
         let forward = events.clone();
@@ -217,7 +220,7 @@ impl Daemon {
             Request::Logout => self.logout().await,
             Request::GetAccount => {
                 let account = match self.session() {
-                    Some(session) => Some(self.with_api(session.account()).await?),
+                    Some(session) => Some(self.account(&session).await?),
                     None => None,
                 };
                 Ok(Response::Account { account })
@@ -225,8 +228,19 @@ impl Daemon {
             Request::ListServers { filter } => self.list_servers(filter).await.map(Response::Servers),
             Request::Connect(request) => {
                 self.session().ok_or_else(not_signed_in)?;
-                self.remember(&request.intent)?;
+                if let Some(destination) = request.destination() {
+                    self.remember(destination)?;
+                }
                 self.engine.connect(request).await?;
+                Ok(Response::Ok)
+            }
+            Request::ConnectProfile { name } => {
+                self.session().ok_or_else(not_signed_in)?;
+                let target = self.target_for(&ConnectTarget::Profile { name }.into(), &self.settings()?)?;
+                if let Target::Profile(profile) = &target {
+                    self.remember(ConnectTarget::Profile { name: profile.name.clone() }.into())?;
+                }
+                self.engine.connect_to(target).await?;
                 Ok(Response::Ok)
             }
             Request::ChangeServer => self.change_server().await,
@@ -241,7 +255,9 @@ impl Daemon {
             }
             Request::GetSettings => Ok(Response::Settings { settings: self.settings()? }),
             Request::SetSettings { settings } => {
+                validate_profiles(&settings).map_err(invalid)?;
                 settings.save(&self.paths.settings_file())?;
+                api::alternative::set_enabled(settings.alternative_routing);
                 let _ = self.events.send(Event::SettingsChanged { settings: settings.clone() });
                 self.engine
                     .apply_settings(settings)
@@ -298,11 +314,28 @@ impl Daemon {
         let _ = self.events.send(Event::SessionChanged { username: Some(username) });
     }
 
-    /// Runs `f`, which needs the API. With a permanent kill switch and nothing connected, the API is let
-    /// through for that time.
+    /// Whether the kill switch blocks the API right now (blocking while nothing is connected).
+    fn api_blocked(&self) -> bool {
+        let settings = self.settings().unwrap_or_default();
+        self.engine.idle_kill_switch_blocks(&settings) && !self.engine.state().is_active()
+    }
+
+    /// The account info. While the kill switch blocks, the cached copy whatever its age: opening the kill
+    /// switch for a status query would send traffic outside the tunnel for nothing.
+    async fn account(&self, session: &Session) -> Result<AccountInfo> {
+        if self.api_blocked()
+            && let Some(account) = session.cached_account()
+        {
+            return Ok(account);
+        }
+        self.with_api(session.account()).await
+    }
+
+    /// Runs `f`, which needs the API. While the kill switch blocks with nothing connected (permanent mode, or
+    /// standard mode after a failure), the API is let through for that time.
     async fn with_api<T>(&self, f: impl Future<Output = T>) -> T {
         let settings = self.settings().unwrap_or_default();
-        if settings.kill_switch != KillSwitchMode::Permanent || self.engine.state().is_active() {
+        if !self.engine.idle_kill_switch_blocks(&settings) || self.engine.state().is_active() {
             return f.await;
         }
         let _window = self.api_window.lock().await;
@@ -313,11 +346,7 @@ impl Daemon {
         }
         let result = f.await;
         // Close it again, unless a connection started meanwhile and owns the kill switch now.
-        if !self.engine.state().is_active()
-            && let Err(e) = engine::apply_idle_kill_switch(&self.settings().unwrap_or(settings)).await
-        {
-            tracing::error!("re-arming the permanent kill switch: {e:#}");
-        }
+        self.engine.guard_idle_kill_switch(true).await;
         result
     }
 
@@ -395,7 +424,7 @@ impl Daemon {
         let session = self.session();
         let (state, details) = (self.engine.state(), self.engine.details());
         let change_server_in = match &session {
-            Some(session) => match session.account().await {
+            Some(session) => match self.account(session).await {
                 Ok(account) if account.max_tier == 0 => self.change_server_wait()?.as_secs(),
                 _ => 0,
             },
@@ -412,21 +441,26 @@ impl Daemon {
         })
     }
 
-    /// Adds a connection target to the recents (most recent first, no duplicates).
-    fn remember(&self, intent: &Intent) -> Result<()> {
-        let target = match intent {
-            Intent::Fastest => ConnectTarget::Fastest,
-            Intent::Country(code) => ConnectTarget::Country { code: code.clone() },
-            Intent::City { country, city } => ConnectTarget::City { country: country.clone(), city: city.clone() },
-            Intent::Server(name) => ConnectTarget::Server { name: name.clone() },
-            Intent::Random | Intent::SecureCore { .. } => return Ok(()),
-        };
+    /// Adds a destination to the recents (most recent first, no duplicates).
+    fn remember(&self, destination: Destination) -> Result<()> {
         let path = self.paths.settings_file();
         let mut settings = Settings::load(&path)?;
-        settings.recents.retain(|t| t != &target);
-        settings.recents.insert(0, target);
+        settings.recents.retain(|t| t != &destination);
+        settings.recents.insert(0, destination);
         settings.recents.truncate(MAX_RECENTS);
         settings.save(&path)
+    }
+
+    /// What to connect to for a favourite, recent or profile name.
+    fn target_for(&self, destination: &Destination, settings: &Settings) -> Result<Target> {
+        if let ConnectTarget::Profile { name } = &destination.target {
+            let profile = settings.profile(name).ok_or_else(|| {
+                anyhow::Error::from(IpcError::new(ErrorKind::InvalidRequest, format!("no profile named {name:?}")))
+            })?;
+            return Ok(Target::Profile(profile.clone()));
+        }
+        let request = select::Request::for_destination(destination).context("not a server target")?;
+        Ok(Target::Proton(request))
     }
 
     fn change_server_policy(&self) -> ChangeServerPolicy {
@@ -448,7 +482,7 @@ impl Daemon {
 
     async fn change_server(&self) -> Result<Response> {
         let session = self.session().ok_or_else(not_signed_in)?;
-        let tier = session.account().await?.max_tier;
+        let tier = self.account(&session).await?.max_tier;
         let mut request = select::Request::new(Intent::Random);
         if let Some(server) = self.engine.state().server().filter(|s| s.wg_config.is_none()) {
             request = request.excluding(server.logical_id.clone());
@@ -471,11 +505,17 @@ impl Daemon {
 
     async fn list_servers(&self, filter: ServerFilter) -> Result<ServerListing> {
         let session = self.session().ok_or_else(not_signed_in)?;
-        let user_tier = match session.account().await {
+        let user_tier = match self.account(&session).await {
             Ok(account) => account.max_tier,
             Err(_) => 0,
         };
-        let cache = match self.with_api(cache::refresh_servers(session.api(), &self.paths, Refresh::IfStale)).await {
+        // While the kill switch blocks, the cached list as it is (the next connection refreshes it).
+        let cached = self.api_blocked().then(|| ServerCache::load(&self.paths.servers_file())).flatten();
+        let fetched = match cached {
+            Some(cache) => Ok(cache),
+            None => self.with_api(cache::refresh_servers(session.api(), &self.paths, Refresh::IfStale)).await,
+        };
+        let cache = match fetched {
             Ok(cache) => cache,
             Err(e) => match ServerCache::load(&self.paths.servers_file()) {
                 Some(cache) => {
@@ -550,12 +590,19 @@ impl Daemon {
         }
         let engine = &self.engine;
         let settings = self.settings().unwrap_or_default();
-        let intent = match &settings.auto_connect {
+        if settings.auto_connect != AutoConnect::Off && !wait_for_network(NETWORK_WAIT).await {
+            tracing::warn!("no default route after {}s; trying to auto-connect anyway", NETWORK_WAIT.as_secs());
+        }
+        let destination: Destination = match &settings.auto_connect {
             AutoConnect::Off => return,
-            AutoConnect::Fastest => Intent::Fastest,
-            AutoConnect::Last => settings.recents.first().map(Intent::from).unwrap_or(Intent::Fastest),
-            AutoConnect::Profile(name) => {
-                let message = format!("auto-connect to profile {name:?}: profiles aren't supported yet (T6.2)");
+            AutoConnect::Fastest => ConnectTarget::Fastest.into(),
+            AutoConnect::Last => settings.recents.first().cloned().unwrap_or_else(|| ConnectTarget::Fastest.into()),
+            AutoConnect::Profile(name) => ConnectTarget::Profile { name: name.clone() }.into(),
+        };
+        let target = match self.target_for(&destination, &settings) {
+            Ok(target) => target,
+            Err(e) => {
+                let message = format!("auto-connect: {e:#}");
                 tracing::warn!("{message}");
                 let _ = self.events.send(Event::Error { message });
                 return;
@@ -563,8 +610,8 @@ impl Daemon {
         };
         let mut states = engine.watch_state();
         for attempt in 1..=AUTO_CONNECT_ATTEMPTS {
-            tracing::info!("auto-connect ({intent:?}), attempt {attempt}");
-            if let Err(e) = engine.connect(select::Request::new(intent.clone())).await {
+            tracing::info!("auto-connect ({destination:?}), attempt {attempt}");
+            if let Err(e) = engine.connect_to(target.clone()).await {
                 tracing::warn!("auto-connect: {e:#}");
             }
             // Wait for the outcome.
@@ -596,8 +643,7 @@ impl Daemon {
         let Some(session) = self.session() else {
             return;
         };
-        let settings = self.settings().unwrap_or_default();
-        if settings.kill_switch == KillSwitchMode::Permanent && !self.engine.state().is_active() {
+        if self.api_blocked() {
             // Not worth opening the firewall every 15 minutes; the next connection refreshes.
             return;
         }
@@ -616,13 +662,72 @@ impl Daemon {
 }
 
 async fn background(daemon: Arc<Daemon>) {
-    daemon.auto_connect().await;
-    let mut refresh = tokio::time::interval(cache::LOADS_REFRESH_INTERVAL);
-    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let guard = async {
+        let mut tick = tokio::time::interval(engine::GUARD_INTERVAL);
+        loop {
+            tick.tick().await;
+            daemon.engine.guard_idle_kill_switch(false).await;
+        }
+    };
+    let connect_and_refresh = async {
+        daemon.auto_connect().await;
+        let mut refresh = tokio::time::interval(cache::LOADS_REFRESH_INTERVAL);
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            refresh.tick().await;
+            daemon.refresh_servers().await;
+        }
+    };
+    tokio::join!(guard, connect_and_refresh);
+}
+
+/// Waits up to `timeout` for a default route: at boot the daemon starts before the network (so that a
+/// permanent kill switch is armed before any traffic flows), and auto-connect needs one.
+async fn wait_for_network(timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        refresh.tick().await;
-        daemon.refresh_servers().await;
+        let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+        let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+        if has_default_route(&v4, &v6) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Whether `/proc/net/route` (main table) or `/proc/net/ipv6_route` has a usable default route on a link
+/// other than loopback and the tunnel.
+fn has_default_route(route: &str, ipv6_route: &str) -> bool {
+    const RTF_REJECT: u32 = 0x0200;
+    let usable = |dev: &str| dev != "lo" && dev != wireguard::INTERFACE;
+    // Iface Destination Gateway Flags RefCnt Use Metric Mask …
+    let v4 = route.lines().skip(1).any(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        f.len() > 7 && f[1] == "00000000" && f[7] == "00000000" && usable(f[0])
+    });
+    // Destination PrefixLen Source PrefixLen NextHop Metric RefCnt Use Flags Device
+    let v6 = ipv6_route.lines().any(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        f.len() > 9
+            && f[0].bytes().all(|b| b == b'0')
+            && f[1] == "00"
+            && u32::from_str_radix(f[8], 16).is_ok_and(|flags| flags & RTF_REJECT == 0)
+            && usable(f[9])
+    });
+    v4 || v6
+}
+
+/// Each profile valid, names unique.
+fn validate_profiles(settings: &Settings) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for profile in &settings.profiles {
+        profile.validate().with_context(|| format!("profile {:?}", profile.name))?;
+        anyhow::ensure!(names.insert(profile.name.as_str()), "two profiles are named {:?}", profile.name);
+    }
+    Ok(())
 }
 
 /// A request the daemon can't carry out as asked (bad config, unknown name).
@@ -670,6 +775,22 @@ mod tests {
     }
 
     /// Signed out, the daemon still imports, lists and deletes WireGuard configs; Proton requests say why not.
+    #[test]
+    fn default_route_detection() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                     eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        let default = format!("{route}eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        let unreachable = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+                           00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n";
+        assert!(!has_default_route(route, unreachable), "only a LAN route and lo's unreachable default");
+        assert!(has_default_route(&default, ""));
+        let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 \
+                  fe800000000000000000000000000001 00000400 00000001 00000000 00450003    wlan0\n";
+        assert!(has_default_route(route, v6));
+        let tunnel = format!("{route}proton0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n");
+        assert!(!has_default_route(&tunnel, ""));
+    }
+
     #[tokio::test]
     async fn signed_out_wg_configs() {
         let dir = tempfile::tempdir().unwrap();
@@ -691,6 +812,22 @@ mod tests {
         assert_eq!(kind(daemon.handle(import("../x", CONFIG)).await), Some(ErrorKind::InvalidRequest));
         let unknown = Request::ConnectWgConfig { name: "nope".into() };
         assert_eq!(kind(daemon.handle(unknown).await), Some(ErrorKind::InvalidRequest));
+
+        let profile = config::Profile::new("work", ConnectTarget::Country { code: "CH".into() }.into());
+        let twice = Settings { profiles: vec![profile.clone(), profile.clone()], ..Settings::default() };
+        assert_eq!(
+            kind(daemon.handle(Request::SetSettings { settings: twice }).await),
+            Some(ErrorKind::InvalidRequest)
+        );
+        let nested = config::Profile::new("loop", ConnectTarget::Profile { name: "work".into() }.into());
+        let bad = Settings { profiles: vec![nested], ..Settings::default() };
+        assert_eq!(kind(daemon.handle(Request::SetSettings { settings: bad }).await), Some(ErrorKind::InvalidRequest));
+        let good = Settings { profiles: vec![profile], ..Settings::default() };
+        // Saved first; applying (the idle kill switch) needs nft and root, which tests may not have.
+        daemon.handle(Request::SetSettings { settings: good.clone() }).await;
+        assert_eq!(daemon.handle(Request::GetSettings).await, Response::Settings { settings: good });
+        let connect = Request::ConnectProfile { name: "work".into() };
+        assert_eq!(kind(daemon.handle(connect).await), Some(ErrorKind::NotSignedIn));
 
         let delete = Request::DeleteWgConfig { name: "ch45".into() };
         assert_eq!(daemon.handle(delete).await, Response::WgConfigs { configs: vec![] });

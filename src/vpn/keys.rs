@@ -204,6 +204,14 @@ impl StoredCertificate {
     }
 
     /// Whether this certificate can be used as is for `keys` and `features` at `now`.
+    /// [`Self::usable`] without the refresh time, for connecting while the API is out of reach (a blocking
+    /// kill switch): the refresh then happens through the tunnel.
+    pub fn usable_offline(&self, keys: &VpnKeys, features: &CertificateFeatures, now: u64) -> bool {
+        self.fingerprint == keys.fingerprint()
+            && &self.features == features
+            && now + MINIMUM_VALIDITY_SECS < self.expiration_time
+    }
+
     pub fn usable(&self, keys: &VpnKeys, features: &CertificateFeatures, now: u64) -> bool {
         self.fingerprint == keys.fingerprint()
             && &self.features == features

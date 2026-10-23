@@ -2,9 +2,13 @@
 # `systemctl enable --now protontui`.
 [Unit]
 Description=Proton VPN daemon (protontui)
-Wants=network-online.target
+# Before the network comes up, so that a permanent kill switch blocks from the first packet on. The daemon
+# needs no network to start; auto-connect waits for a default route.
+Wants=network-pre.target
+Before=network-pre.target
 # After firewall services that load a ruleset with `flush ruleset`, which would wipe the kill switch table.
-After=network-online.target nftables.service firewalld.service iptables.service
+# (A firewall reloaded later is caught too: the daemon re-arms its tables within seconds.)
+After=local-fs.target nftables.service firewalld.service iptables.service ip6tables.service
 
 [Service]
 Type=simple
@@ -12,8 +16,10 @@ ExecStart=/usr/local/bin/protontui daemon
 # SIGTERM disconnects cleanly (a permanent kill switch stays armed).
 KillSignal=SIGTERM
 TimeoutStopSec=30
+# A daemon that dies (crash, kill -9) is started again; it cleans up after the dead connection, and a standard
+# or permanent kill switch keeps blocking meanwhile.
 Restart=on-failure
-RestartSec=5
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

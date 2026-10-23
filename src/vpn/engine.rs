@@ -11,6 +11,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,7 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::api::servers::DeviceLocation;
 use crate::api::{self, ApiClient};
-use crate::config::{self, KillSwitchMode, Paths, Settings};
+use crate::config::{self, KillSwitchMode, Paths, Profile, Settings};
 use crate::servers::cache::{self, Refresh};
 use crate::servers::model::{ServerList, Visibility};
 use crate::servers::select::{self, Request};
@@ -55,6 +56,15 @@ pub const MAX_PORTS_PER_SERVER: usize = 2;
 pub const STALE_HANDSHAKE: Duration = Duration::from_secs(180);
 /// Network events are collected for this long before the tunnel is checked.
 const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// How often the firewall tables and DNS are checked for changes made behind our back (a firewall reload, a
+/// DHCP renewal). The daemon checks the idle kill switch just as often ([`Engine::guard_idle_kill_switch`]).
+pub const GUARD_INTERVAL: Duration = Duration::from_secs(5);
+/// Pauses between rounds of re-establishing a lost tunnel: doubling from the first to the second.
+const RECONNECT_PAUSE_MIN: Duration = Duration::from_secs(5);
+const RECONNECT_PAUSE_MAX: Duration = Duration::from_secs(60);
+/// The state after a crash cleanup that kept the kill switch.
+const CRASHED_REASON: &str = "protontui stopped unexpectedly while connected; the kill switch keeps blocking traffic \
+                              outside the tunnel until you connect again or disconnect";
 const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// A certificate the local agent rejects again within this time after a renewal ends the connection.
 const CERTIFICATE_RENEWAL_BACKOFF: Duration = Duration::from_secs(600);
@@ -262,11 +272,21 @@ fn process_is_protontui(pid: u32) -> bool {
         .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains("protontui"))
 }
 
+/// What [`cleanup_stale`] did.
+#[derive(Debug, Default)]
+pub struct StaleCleanup {
+    /// Empty when there was no record.
+    pub actions: Vec<String>,
+    /// The mode of the crashed connection's kill switch, when it was left blocking (standard or permanent).
+    pub kill_switch_kept: Option<KillSwitchMode>,
+}
+
 /// Cleans up after a crashed engine, using its record. Errors when another live process owns the connection.
-/// Returns what was done (empty when there was no record).
-pub async fn cleanup_stale() -> Result<Vec<String>> {
+/// The kill switch stays unless it was off: permanent mode always blocks, and in standard mode a connection
+/// that ended without the user disconnecting keeps blocking until they do, as after a failed connection.
+pub async fn cleanup_stale() -> Result<StaleCleanup> {
     let Some(state) = RuntimeState::load()? else {
-        return Ok(Vec::new());
+        return Ok(StaleCleanup::default());
     };
     if state.owner_alive() {
         bail!("protontui (pid {}) already owns the connection; disconnect it first", state.pid);
@@ -275,13 +295,13 @@ pub async fn cleanup_stale() -> Result<Vec<String>> {
     let mut actions = vec![format!("cleaned up after pid {}", state.pid)];
     let (connection, handle, _) = rtnetlink::new_connection().context("opening netlink")?;
     let task = tokio::spawn(connection);
-    // A permanent kill switch stays; anything else goes with the crashed connection.
-    let keep = (state.kill_switch.mode == KillSwitchMode::Permanent).then(|| state.kill_switch.idle_rules());
+    let keep = (state.kill_switch.mode != KillSwitchMode::Off).then(|| state.kill_switch.idle_rules());
+    let kill_switch_kept = keep.is_some().then_some(state.kill_switch.mode);
     let result = teardown_host(&handle, state.dns, state.ifindex, keep).await;
     task.abort();
     actions.extend(result?);
     RuntimeState::remove()?;
-    Ok(actions)
+    Ok(StaleCleanup { actions, kill_switch_kept })
 }
 
 /// Undoes DNS, routing and the tunnel link, then removes the kill switch, or leaves `keep_kill_switch`
@@ -335,6 +355,8 @@ async fn teardown_host(
 pub enum Target {
     /// A Proton server picked from the server list; needs a session.
     Proton(Request),
+    /// A profile's target, with its port and feature overrides; needs a session.
+    Profile(Profile),
     /// An imported WireGuard config, by name (no session needed).
     WgConfig(String),
 }
@@ -355,23 +377,45 @@ struct Inner {
     /// Settings changed while connected, for the connection task to apply live.
     settings: watch::Sender<Option<Settings>>,
     running: Mutex<Option<Running>>,
+    /// A standard-mode connection that ended without the user disconnecting (failure, crash, replaced) left
+    /// the kill switch blocking. Permanent mode always blocks while idle, off mode never.
+    kill_switch_kept: AtomicBool,
 }
 
 struct Running {
-    cancel: watch::Sender<bool>,
+    stop: watch::Sender<Option<Stop>>,
     task: JoinHandle<()>,
 }
 
+/// Why a connection task is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The user disconnects: a standard kill switch goes too.
+    Disconnect,
+    /// Another connection takes over: the kill switch keeps blocking in between.
+    Replace,
+}
+
 impl Engine {
-    /// Cleans up after a crashed run if needed, then returns an idle engine without a session. Needs root.
+    /// Cleans up after a crashed run if needed, then returns an idle engine without a session. Needs root. When
+    /// the crashed run's kill switch was kept, the engine starts in the `Error` state, which `disconnect`
+    /// leaves (releasing a standard kill switch).
     pub async fn start(paths: Paths) -> Result<Self> {
+        let mut initial = ConnectionState::Disconnected;
+        let mut standard_kept = false;
         // Without root there's nothing this process could clean (or connect); development runs get this far.
         if nix::unistd::geteuid().is_root() {
-            for action in cleanup_stale().await? {
+            let cleanup = cleanup_stale().await?;
+            for action in &cleanup.actions {
                 tracing::info!("startup cleanup: {action}");
             }
+            if cleanup.kill_switch_kept.is_some() {
+                initial = ConnectionState::Error { reason: CRASHED_REASON.into() };
+            }
+            standard_kept = cleanup.kill_switch_kept == Some(KillSwitchMode::Standard);
         }
-        let (state, _) = watch::channel(ConnectionState::Disconnected);
+        let kill_switch_kept = AtomicBool::new(standard_kept);
+        let (state, _) = watch::channel(initial);
         let (events, _) = broadcast::channel(256);
         let (settings, _) = watch::channel(None);
         let inner = Inner {
@@ -382,6 +426,7 @@ impl Engine {
             details: Default::default(),
             settings,
             running: Mutex::new(None),
+            kill_switch_kept,
         };
         Ok(Self { inner: Arc::new(inner) })
     }
@@ -418,37 +463,93 @@ impl Engine {
     /// Starts connecting to a Proton server (replacing any current connection) and returns; progress arrives
     /// as events.
     pub async fn connect(&self, request: Request) -> Result<()> {
-        if self.session().is_none() {
-            bail!("not signed in");
-        }
         self.connect_to(Target::Proton(request)).await
     }
 
-    /// Like [`Engine::connect`], for a [`Target`].
+    /// Like [`Engine::connect`], for a [`Target`]. A current connection is replaced without lifting the kill
+    /// switch in between; the new one lets the API through it while preparing.
     pub async fn connect_to(&self, target: Target) -> Result<()> {
-        self.disconnect().await?;
+        if !matches!(target, Target::WgConfig(_)) && self.session().is_none() {
+            bail!("not signed in");
+        }
         let mut running = self.inner.running.lock().await;
-        let (cancel, cancelled) = watch::channel(false);
+        if let Some(previous) = running.take() {
+            let _ = previous.stop.send(Some(Stop::Replace));
+            previous.task.await.context("the connection task panicked")?;
+        }
+        let (stop, stopped) = watch::channel(None);
         let inner = self.inner.clone();
         inner.set_state(ConnectionState::Connecting { server: None });
-        let task = tokio::spawn(run_connection(inner, target, cancelled));
-        *running = Some(Running { cancel, task });
+        let task = tokio::spawn(run_connection(inner, target, stopped));
+        *running = Some(Running { stop, task });
         Ok(())
     }
 
-    /// Disconnects and waits until the host is back to its original state. After a failed connection (state
-    /// `Error`), this is what releases a standard kill switch that kept blocking.
+    /// Disconnects and waits until the host is back to its original state. After a failed or crashed
+    /// connection (state `Error`), this is what releases a standard kill switch that kept blocking.
     pub async fn disconnect(&self) -> Result<()> {
-        if let Some(running) = self.inner.running.lock().await.take() {
-            let _ = running.cancel.send(true);
-            running.task.await.context("the connection task panicked")?;
+        // Held throughout, so that the idle guard can't re-arm what this releases.
+        let mut running = self.inner.running.lock().await;
+        if let Some(current) = running.take() {
+            let _ = current.stop.send(Some(Stop::Disconnect));
+            current.task.await.context("the connection task panicked")?;
         }
         if matches!(self.state(), ConnectionState::Error { .. }) {
             let settings = Settings::load(&self.inner.paths.settings_file())?;
+            self.inner.kill_switch_kept.store(false, Ordering::SeqCst);
             apply_idle_kill_switch(&settings).await?;
             self.inner.set_state(ConnectionState::Disconnected);
         }
         Ok(())
+    }
+
+    /// Whether the kill switch should block while no connection runs, with these settings: always in
+    /// permanent mode, and in standard mode after a connection ended without the user disconnecting.
+    pub fn idle_kill_switch_blocks(&self, settings: &Settings) -> bool {
+        match settings.kill_switch {
+            KillSwitchMode::Permanent => true,
+            KillSwitchMode::Standard => self.inner.kill_switch_kept.load(Ordering::SeqCst),
+            KillSwitchMode::Off => false,
+        }
+    }
+
+    /// While no connection runs, puts back a kill switch that should be blocking ([`Self::idle_kill_switch_blocks`])
+    /// when something removed it: a firewall reload (Alpine's `/etc/nftables.nft` starts with `flush ruleset`),
+    /// or an admin. With `force`, puts the idle state back even when the table is there (closing an API
+    /// window). The daemon calls this every [`GUARD_INTERVAL`].
+    pub async fn guard_idle_kill_switch(&self, force: bool) {
+        let running = self.inner.running.lock().await;
+        if running.as_ref().is_some_and(|r| !r.task.is_finished()) {
+            return;
+        }
+        let Ok(settings) = Settings::load(&self.inner.paths.settings_file()) else { return };
+        let blocks = self.idle_kill_switch_blocks(&settings);
+        let rules = KillSwitchRecord::from(&settings).idle_rules();
+        if force {
+            let result = if blocks { killswitch::apply(&rules).await } else { apply_idle_kill_switch(&settings).await };
+            if let Err(e) = result {
+                tracing::error!("putting the idle kill switch back: {e:#}");
+            }
+            return;
+        }
+        if !blocks {
+            return;
+        }
+        match killswitch::installed_tables().await {
+            Ok(Some(tables)) if !tables.iter().any(|(f, n)| f == "inet" && n == killswitch::TABLE) => {
+                match killswitch::apply(&rules).await {
+                    Ok(()) => {
+                        tracing::warn!("the kill switch table was removed (firewall reload?); re-armed it");
+                        self.inner.emit(Event::Warning(
+                            "the firewall rules were removed (a firewall reload?); the kill switch is back on".into(),
+                        ));
+                    }
+                    Err(e) => tracing::error!("re-arming the kill switch: {e:#}"),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("checking the kill switch table: {e:#}"),
+        }
     }
 
     /// Applies changed settings: live to a running connection (kill switch, local agent features), or to the
@@ -457,8 +558,14 @@ impl Engine {
         let running = self.inner.running.lock().await;
         let active = running.as_ref().is_some_and(|r| !r.task.is_finished());
         self.inner.settings.send_replace(Some(settings.clone()));
-        if !active && !matches!(self.state(), ConnectionState::Error { .. }) {
-            apply_idle_kill_switch(&settings).await?;
+        if !active {
+            if settings.kill_switch == KillSwitchMode::Standard && self.inner.kill_switch_kept.load(Ordering::SeqCst) {
+                // Still blocking after a failure; "allow LAN" may have changed.
+                killswitch::apply(&KillSwitchRecord::from(&settings).idle_rules()).await?;
+            } else {
+                self.inner.kill_switch_kept.store(false, Ordering::SeqCst);
+                apply_idle_kill_switch(&settings).await?;
+            }
         }
         Ok(())
     }
@@ -509,6 +616,12 @@ struct Connection {
     tunnel: Option<Tunnel>,
     agent: Option<Agent>,
     record: RuntimeState,
+    /// The resolvers set for this connection, to put back when someone rewrites resolv.conf.
+    dns_servers: Vec<IpAddr>,
+    /// Cleared when re-applying DNS doesn't stick (another program keeps rewriting it), to stop retrying.
+    guard_dns: bool,
+    /// Resolvers the kill switch lets through on the LAN (custom DNS, an imported config's DNS).
+    dns_allowed: Vec<IpAddr>,
 }
 
 impl Connection {
@@ -517,7 +630,16 @@ impl Connection {
         let record =
             RuntimeState { pid: std::process::id(), started_at: config::unix_now(), kill_switch, ..Default::default() };
         record.save()?;
-        Ok(Self { rt, rt_task: tokio::spawn(connection), tunnel: None, agent: None, record })
+        Ok(Self {
+            rt,
+            rt_task: tokio::spawn(connection),
+            tunnel: None,
+            agent: None,
+            record,
+            dns_servers: Vec::new(),
+            guard_dns: true,
+            dns_allowed: Vec::new(),
+        })
     }
 
     fn update(&mut self, change: impl FnOnce(&mut RuntimeState)) {
@@ -528,7 +650,13 @@ impl Connection {
     }
 
     fn kill_switch_rules(&self, endpoint: SocketAddrV4, ipv6: bool) -> Rules {
-        Rules { allow_lan: self.record.kill_switch.allow_lan, ipv6, endpoint: Some(endpoint), api: None }
+        Rules {
+            allow_lan: self.record.kill_switch.allow_lan,
+            ipv6,
+            endpoint: Some(endpoint),
+            dns_allowed: self.dns_allowed.clone(),
+            ..Rules::default()
+        }
     }
 
     /// Blocks everything but the tunnel and `endpoint` while (re)connecting. As in api-core, this happens even
@@ -596,19 +724,22 @@ struct Prepared {
     candidates: Vec<ServerInfo>,
     /// X25519 keys of the candidates, in the same order.
     peer_keys: Vec<[u8; 32]>,
+    /// The profile this connection runs with: its overrides apply on top of every settings change.
+    profile: Option<Profile>,
     /// Whether IPv6 goes through the tunnel: the setting, if the best candidate supports it (api-core). Routing
     /// is set up once per connection, so failover servers inherit it; on one without IPv6 the v6 traffic is
     /// then dropped inside the tunnel, which is no leak.
     ipv6: bool,
 }
 
-async fn run_connection(inner: Arc<Inner>, target: Target, mut cancelled: watch::Receiver<bool>) {
+async fn run_connection(inner: Arc<Inner>, target: Target, mut stop: watch::Receiver<Option<Stop>>) {
     let mut connection = None;
     let session = inner.session();
     let outcome = tokio::select! {
         result = connect_and_monitor(&inner, &target, &mut connection) => result,
-        _ = cancelled.changed() => Ok(()),
+        _ = stop.changed() => Ok(()),
     };
+    let replaced = *stop.borrow() == Some(Stop::Replace);
     if let Err(e) = &outcome {
         tracing::error!("connection failed: {e:#}");
     }
@@ -616,13 +747,17 @@ async fn run_connection(inner: Arc<Inner>, target: Target, mut cancelled: watch:
     let teardown = match connection {
         Some(connection) => {
             // Permanent: always. Standard: after a failure, until the user disconnects (api-core's Error state
-            // keeps it too). Off: never.
+            // keeps it too), and while another connection takes over. Off: never.
             let keep = match connection.record.kill_switch.mode {
                 KillSwitchMode::Permanent => true,
-                KillSwitchMode::Standard => outcome.is_err(),
+                KillSwitchMode::Standard => outcome.is_err() || replaced,
                 KillSwitchMode::Off => false,
             };
-            connection.teardown(keep).await
+            let standard = connection.record.kill_switch.mode == KillSwitchMode::Standard;
+            api::alternative::set_tunnel_up(false);
+            let result = connection.teardown(keep).await;
+            inner.kill_switch_kept.store(standard && keep && result.is_ok(), Ordering::SeqCst);
+            result
         }
         None => Ok(()),
     };
@@ -650,37 +785,34 @@ async fn connect_and_monitor(inner: &Inner, target: &Target, slot: &mut Option<C
     let mut settings_changes = inner.settings.subscribe();
     let connection = slot.insert(Connection::new(KillSwitchRecord::from(&settings))?);
     let mut prepared = match target {
-        Target::Proton(request) => {
-            let session = inner.session().context("not signed in")?;
-            if settings.kill_switch == KillSwitchMode::Permanent {
-                // The permanent kill switch blocks the API too; open a hole for it until the tunnel is up.
-                let base_url = session.api().base_url().to_owned();
-                let host = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_owned));
-                let host = host.with_context(|| format!("no host in the API URL {base_url}"))?;
-                killswitch::open_api_window(&connection.record.kill_switch.idle_rules(), &host)
-                    .await
-                    .context("letting the API through the permanent kill switch")?;
-            }
-            prepare(inner, session, request, settings).await?
+        Target::Proton(request) => prepare_proton(inner, connection, request, None, settings).await?,
+        Target::Profile(profile) => {
+            let request = select::Request::for_destination(&profile.target)
+                .with_context(|| format!("profile {:?} points at another profile", profile.name))?;
+            prepare_proton(inner, connection, &request, Some(profile), settings).await?
         }
         Target::WgConfig(name) => prepare_wg_config(inner, name, settings).await?,
     };
     let (agent_events_tx, mut agent_events) = mpsc::unbounded_channel();
+    // Before the kill switch is armed for the server: the resolvers it lets through on the LAN.
+    let servers = dns_servers(&prepared, inner);
+    connection.dns_allowed = servers.clone();
     let (mut index, mut server) = establish(inner, &prepared, connection, 0).await?;
 
     // DNS
-    let servers = dns_servers(&prepared, inner);
     let backend = dns::Backend::detect().await;
     let ifindex = connection.tunnel.as_ref().map(Tunnel::index);
     // Recorded before applying, so a crash halfway still gets reverted.
     connection.update(|r| r.dns = Some(backend));
     backend.apply(ifindex.unwrap_or(0), &servers).await?;
     tracing::info!("DNS via {backend:?}: {servers:?}");
+    connection.dns_servers = servers;
 
     connection.settle_kill_switch(endpoint_of(&server), prepared.ipv6).await?;
     start_agent(inner, &prepared, connection, &server, &agent_events_tx);
 
     let since = config::unix_now();
+    api::alternative::set_tunnel_up(true);
     connection.update(|r| {
         r.server = Some(server.clone());
         r.connected_since = Some(since);
@@ -704,7 +836,7 @@ async fn connect_and_monitor(inner: &Inner, target: &Target, slot: &mut Option<C
         tracing::warn!("re-establishing the tunnel: {reason}");
         inner.set_state(ConnectionState::Reconnecting { server: server.clone(), reason });
         // The same server first: after a network change it usually just needs a new handshake.
-        (index, server) = establish(inner, &prepared, connection, index).await?;
+        (index, server) = reestablish(inner, &prepared, connection, index, &server).await?;
         connection.settle_kill_switch(endpoint_of(&server), prepared.ipv6).await?;
         start_agent(inner, &prepared, connection, &server, &agent_events_tx);
         prepared.api.reset_connections();
@@ -712,6 +844,42 @@ async fn connect_and_monitor(inner: &Inner, target: &Target, slot: &mut Option<C
         spawn_location_fetch(inner, &prepared.api);
     }
 }
+
+/// [`prepare`] for a Proton server. A kill switch that's blocking already (permanent mode, or left by the
+/// connection this one replaces, a failure or a crash) blocks the API too. Then the caches are tried first,
+/// so that nothing at all leaves outside the tunnel when they suffice (a reconnect, auto-connect after a
+/// crash); only when something is missing does a hole open for the API until the tunnel is up.
+async fn prepare_proton(
+    inner: &Inner,
+    connection: &Connection,
+    request: &Request,
+    profile: Option<&Profile>,
+    settings: Settings,
+) -> Result<Prepared> {
+    let session = inner.session().context("not signed in")?;
+    if killswitch::is_armed().await {
+        match prepare(inner, session.clone(), request, profile, settings.clone(), true).await {
+            Ok(prepared) => {
+                tracing::info!("prepared from the caches; the kill switch stays closed to the API");
+                return Ok(prepared);
+            }
+            Err(e) if e.downcast_ref::<NeedsApi>().is_some() => tracing::info!("{e:#}"),
+            Err(e) => return Err(e),
+        }
+        let base_url = session.api().base_url().to_owned();
+        let host = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_owned));
+        let host = host.with_context(|| format!("no host in the API URL {base_url}"))?;
+        killswitch::open_api_window(&connection.record.kill_switch.idle_rules(), &host)
+            .await
+            .context("letting the API through the kill switch")?;
+    }
+    prepare(inner, session, request, profile, settings, false).await
+}
+
+/// [`prepare`] from the caches alone came up short: it needs the API.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} isn't cached; the API is needed")]
+struct NeedsApi(&'static str);
 
 fn endpoint_of(server: &ServerInfo) -> SocketAddrV4 {
     SocketAddrV4::new(server.entry_ip, server.port)
@@ -751,19 +919,51 @@ fn start_agent(
     connection.agent = Some(Agent::spawn(params, features, events.clone()));
 }
 
-/// Loads account, client config and servers, and the certificate; picks the candidates.
-async fn prepare(inner: &Inner, session: Arc<Session>, request: &Request, settings: Settings) -> Result<Prepared> {
+/// Loads account, client config and servers, and the certificate; picks the candidates. A profile's
+/// overrides apply to the settings first, and its port replaces clientconfig's list.
+/// With `cached_only`, no API call at all: the account, certificate, client config and server list come from
+/// their caches whatever their age (a certificate still has to match and stay valid a while); anything
+/// missing is a [`NeedsApi`] error. Once connected, the certificate check refreshes what's due through the
+/// tunnel.
+async fn prepare(
+    inner: &Inner,
+    session: Arc<Session>,
+    request: &Request,
+    profile: Option<&Profile>,
+    mut settings: Settings,
+    cached_only: bool,
+) -> Result<Prepared> {
+    if let Some(profile) = profile {
+        profile.apply(&mut settings);
+        tracing::info!("connecting with profile {:?}", profile.name);
+    }
     let paths = &inner.paths;
     let api = session.api();
-    let account = session.account().await.context("fetching account info")?;
+    let account = match cached_only {
+        true => session.cached_account().ok_or(NeedsApi("the account info"))?,
+        false => session.account().await.context("fetching account info")?,
+    };
     let tier = account.max_tier;
 
     let keys = VpnKeys::load_or_generate(&paths.keys_file())?;
     let features = CertificateFeatures::from_settings(&settings, tier);
-    keys::ensure_certificate(api, paths, &keys, features).await?;
+    if cached_only {
+        StoredCertificate::load(&paths.certificate_file())?
+            .filter(|c| c.usable_offline(&keys, &features, config::unix_now()))
+            .ok_or(NeedsApi("a usable VPN certificate"))?;
+    } else {
+        keys::ensure_certificate(api, paths, &keys, features).await?;
+    }
 
-    let client_config = cache::client_config(api, paths).await.context("fetching the client config")?;
-    let server_cache = cache::refresh_servers(api, paths, Refresh::IfStale).await.context("fetching servers")?;
+    let (client_config, server_cache) = if cached_only {
+        let config =
+            cache::CachedClientConfig::load(&paths.client_config_file()).ok_or(NeedsApi("the client config"))?;
+        let servers = cache::ServerCache::load(&paths.servers_file()).ok_or(NeedsApi("the server list"))?;
+        (config.config, servers)
+    } else {
+        let config = cache::client_config(api, paths).await.context("fetching the client config")?;
+        (config, cache::refresh_servers(api, paths, Refresh::IfStale).await.context("fetching servers")?)
+    };
     let list = ServerList::build(&server_cache.logicals, Visibility::default());
 
     let selection = {
@@ -819,8 +1019,15 @@ async fn prepare(inner: &Inner, session: Arc<Session>, request: &Request, settin
         ports.push(DEFAULT_WIREGUARD_PORT);
     }
     ports.truncate(MAX_PORTS_PER_SERVER);
+    if let Some(port) = profile.and_then(|p| p.port) {
+        if !client_config.default_ports.wireguard.udp.contains(&port) {
+            inner.emit(Event::Warning(format!("port {port} isn't one Proton lists for WireGuard; trying it anyway")));
+        }
+        ports = vec![port];
+    }
     Ok(Prepared {
         settings,
+        profile: profile.cloned(),
         api: api.clone(),
         session: Some(session.clone()),
         tier,
@@ -863,6 +1070,7 @@ async fn prepare_wg_config(inner: &Inner, name: &str, settings: Settings) -> Res
     };
     Ok(Prepared {
         settings,
+        profile: None,
         session: None,
         api: ApiClient::new(api::DEFAULT_BASE_URL)?,
         tier: 0,
@@ -916,6 +1124,44 @@ async fn establish(
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("no server to try")).context("no server answered"))
+}
+
+/// [`establish`] after the tunnel was lost, retried with growing pauses for as long as it takes: the network
+/// may be gone for a while (suspend, Wi-Fi out of range, cable out). The kill switch keeps blocking meanwhile.
+/// Gives up only once the certificate has expired: the servers then refuse the key, and the kill switch
+/// blocks the API that would issue a new one.
+async fn reestablish(
+    inner: &Inner,
+    prepared: &Prepared,
+    connection: &mut Connection,
+    start: usize,
+    server: &ServerInfo,
+) -> Result<(usize, ServerInfo)> {
+    let mut pause = RECONNECT_PAUSE_MIN;
+    loop {
+        match establish(inner, prepared, connection, start).await {
+            Ok(found) => return Ok(found),
+            Err(e) if certificate_expired(inner, prepared) => {
+                return Err(e.context("the VPN certificate expired meanwhile; connect again"));
+            }
+            Err(e) => {
+                let reason = format!("{e:#}; trying again in {}s", pause.as_secs());
+                tracing::warn!("re-establishing the tunnel: {reason}");
+                inner.set_state(ConnectionState::Reconnecting { server: server.clone(), reason });
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(RECONNECT_PAUSE_MAX);
+            }
+        }
+    }
+}
+
+/// Whether the API certificate the servers know our key by has expired (never for an imported config).
+fn certificate_expired(inner: &Inner, prepared: &Prepared) -> bool {
+    prepared.keys.is_some()
+        && StoredCertificate::load(&inner.paths.certificate_file())
+            .ok()
+            .flatten()
+            .is_none_or(|c| c.expiration_time <= config::unix_now())
 }
 
 /// Arms the kill switch for `endpoint`, creates (or re-points) the tunnel for `config` and waits for a
@@ -1000,6 +1246,15 @@ async fn monitor(
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut certificate_check = tokio::time::interval(CERTIFICATE_CHECK_INTERVAL);
+    let mut guard = tokio::time::interval(GUARD_INTERVAL);
+    // resolv.conf rewrites are caught at once; the guard's 5 s check stays as the fallback.
+    let mut resolv_changes = match dns::watch_resolv_conf() {
+        Ok(changes) => Some(changes),
+        Err(e) => {
+            tracing::debug!("not watching resolv.conf: {e:#}");
+            None
+        }
+    };
     let mut previous: Option<(PeerStats, Instant)> = None;
     let mut network_changed_at: Option<Instant> = None;
     let mut certificate_renewed_at: Option<Instant> = None;
@@ -1023,6 +1278,13 @@ async fn monitor(
                     return Ok("the network changed".into());
                 }
             }
+            _ = guard.tick() => restore_host_changes(inner, prepared, connection, server).await,
+            Some(()) = async {
+                match resolv_changes.as_mut() {
+                    Some(changes) => changes.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => restore_dns(inner, connection).await,
             Some((message, _)) = net_events.next() => {
                 if is_relevant_network_change(&message.payload, tunnel_index) {
                     network_changed_at.get_or_insert_with(Instant::now);
@@ -1079,6 +1341,68 @@ async fn monitor(
     }
 }
 
+/// Puts back what others removed while connected: a firewall reload (`flush ruleset`) takes the kill switch
+/// and the conntrack mark rules with it (without those, strict rp_filter drops the tunnel's replies), and a
+/// DHCP renewal or network manager may rewrite resolv.conf, which would send DNS around the tunnel.
+async fn restore_host_changes(inner: &Inner, prepared: &Prepared, connection: &mut Connection, server: &ServerInfo) {
+    let mut restored = Vec::new();
+    match killswitch::installed_tables().await {
+        Ok(Some(tables)) => {
+            let has = |family: &str, name: &str| tables.iter().any(|(f, n)| f == family && n == name);
+            if !has("inet", routing::MARK_TABLE) {
+                match routing::apply_mark_rules(prepared.ipv6).await {
+                    Ok(_) => restored.push("the conntrack mark rules"),
+                    Err(e) => tracing::warn!("restoring the conntrack mark rules: {e:#}"),
+                }
+            }
+            if connection.record.kill_switch.mode == KillSwitchMode::Off {
+                if !has("ip6", killswitch::IPV6_LEAK_TABLE) {
+                    match killswitch::apply_ipv6_leak_protection().await {
+                        Ok(()) => restored.push("IPv6 leak protection"),
+                        Err(e) => tracing::debug!("restoring IPv6 leak protection: {e:#}"),
+                    }
+                }
+            } else if !has("inet", killswitch::TABLE) {
+                match connection.settle_kill_switch(endpoint_of(server), prepared.ipv6).await {
+                    Ok(()) => restored.push("the kill switch"),
+                    Err(e) => tracing::error!("restoring the kill switch: {e:#}"),
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!("checking the firewall tables: {e:#}"),
+    }
+    if !restored.is_empty() {
+        let message = format!("the firewall rules were removed (a firewall reload?); restored {}", restored.join(", "));
+        tracing::warn!("{message}");
+        inner.emit(Event::Warning(message));
+    }
+
+    restore_dns(inner, connection).await;
+}
+
+/// Points DNS back at the tunnel's resolvers if resolv.conf was rewritten (a DHCP renewal, a network manager).
+async fn restore_dns(inner: &Inner, connection: &mut Connection) {
+    if let Some(backend) = connection.record.dns
+        && connection.guard_dns
+        && !backend.is_applied(&connection.dns_servers)
+    {
+        let ifindex = connection.tunnel.as_ref().map(Tunnel::index).unwrap_or(0);
+        let message = match backend.reapply(ifindex, &connection.dns_servers).await {
+            Ok(()) if backend.is_applied(&connection.dns_servers) => {
+                "resolv.conf was rewritten (a DHCP renewal?); DNS goes through the tunnel again".to_owned()
+            }
+            Ok(()) => {
+                connection.guard_dns = false;
+                format!("another program keeps rewriting {}; DNS may bypass the tunnel", dns::RESOLV_CONF)
+            }
+            Err(e) => format!("resolv.conf was rewritten, and setting DNS again failed: {e:#}"),
+        };
+        tracing::warn!("{message}");
+        inner.emit(Event::Warning(message));
+    }
+}
+
 /// Settings changed while connected: the kill switch and the local agent's features follow at once (the
 /// certificate check picks up the features too); IPv6 and DNS changes need a new connection.
 async fn apply_live_settings(
@@ -1086,8 +1410,11 @@ async fn apply_live_settings(
     prepared: &mut Prepared,
     connection: &mut Connection,
     server: &ServerInfo,
-    settings: Settings,
+    mut settings: Settings,
 ) {
+    if let Some(profile) = &prepared.profile {
+        profile.apply(&mut settings);
+    }
     let old = std::mem::replace(&mut prepared.settings, settings);
     let settings = &prepared.settings;
     let kill_switch = KillSwitchRecord::from(settings);

@@ -15,7 +15,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::api::servers::ClientConfig;
-use crate::config::{ConnectTarget, Settings};
+use crate::config::{ConnectTarget, Destination, Settings};
 use crate::servers::model::{LogicalServer, PhysicalServer, ServerList};
 
 /// `MAX_LOGICAL_SERVERS_IN_TOTAL` in win-app's `ServerListGenerator`.
@@ -46,19 +46,50 @@ pub enum Intent {
     },
 }
 
-impl From<&ConnectTarget> for Intent {
-    fn from(target: &ConnectTarget) -> Self {
-        match target {
+impl Intent {
+    /// The intent for `target`; `None` for a profile, which the daemon resolves first.
+    pub fn for_target(target: &ConnectTarget) -> Option<Self> {
+        Some(match target {
             ConnectTarget::Fastest => Intent::Fastest,
             ConnectTarget::Country { code } => Intent::Country(code.clone()),
             ConnectTarget::City { country, city } => Intent::City { country: country.clone(), city: city.clone() },
             ConnectTarget::Server { name } => Intent::Server(name.clone()),
-        }
+            ConnectTarget::SecureCore { exit, entry } => {
+                Intent::SecureCore { exit: exit.clone(), entry: entry.clone() }
+            }
+            ConnectTarget::Profile { .. } => return None,
+        })
+    }
+
+    /// What favourites and recents store for this intent; `None` for [`Intent::Random`].
+    pub fn target(&self) -> Option<ConnectTarget> {
+        Some(match self {
+            Intent::Fastest => ConnectTarget::Fastest,
+            Intent::Country(code) => ConnectTarget::Country { code: code.clone() },
+            Intent::City { country, city } => ConnectTarget::City { country: country.clone(), city: city.clone() },
+            Intent::Server(name) => ConnectTarget::Server { name: name.clone() },
+            Intent::SecureCore { exit, entry } => {
+                ConnectTarget::SecureCore { exit: exit.clone(), entry: entry.clone() }
+            }
+            Intent::Random => return None,
+        })
+    }
+}
+
+impl Request {
+    /// The request for a favourite or recent; `None` for a profile.
+    pub fn for_destination(destination: &Destination) -> Option<Self> {
+        Some(Self { intent: Intent::for_target(&destination.target)?, feature: destination.feature, exclude: None })
+    }
+
+    /// What recents remember of this request; `None` for "change server" (random).
+    pub fn destination(&self) -> Option<Destination> {
+        Some(Destination { target: self.intent.target()?, feature: self.feature })
     }
 }
 
 /// Server feature a connection requires. Without one, Tor servers are left out (win-app `IsStandard`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FeatureFilter {
     P2P,
@@ -586,8 +617,17 @@ mod tests {
 
     #[test]
     fn connect_targets_map_to_intents() {
-        assert_eq!(Intent::from(&ConnectTarget::Fastest), Intent::Fastest);
-        assert_eq!(Intent::from(&ConnectTarget::Country { code: "CH".into() }), country("CH"));
-        assert_eq!(Intent::from(&ConnectTarget::Server { name: "CH#1".into() }), Intent::Server("CH#1".into()));
+        assert_eq!(Intent::for_target(&ConnectTarget::Fastest), Some(Intent::Fastest));
+        assert_eq!(Intent::for_target(&ConnectTarget::Country { code: "CH".into() }), Some(country("CH")));
+        assert_eq!(
+            Intent::for_target(&ConnectTarget::Server { name: "CH#1".into() }),
+            Some(Intent::Server("CH#1".into()))
+        );
+        assert_eq!(Intent::for_target(&ConnectTarget::Profile { name: "work".into() }), None);
+        let sc = Intent::SecureCore { exit: Some("CH".into()), entry: Some("IS".into()) };
+        assert_eq!(Intent::for_target(&sc.target().unwrap()), Some(sc));
+        assert_eq!(Intent::Random.target(), None);
+        let p2p = Request::new(country("SE")).with_feature(FeatureFilter::P2P);
+        assert_eq!(Request::for_destination(&p2p.destination().unwrap()), Some(p2p));
     }
 }

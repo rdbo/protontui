@@ -52,6 +52,13 @@ pub struct Rules {
     /// The API, while a permanent kill switch is connecting. Never persisted.
     #[serde(skip)]
     pub api: Option<ApiAccess>,
+    /// With `allow_lan`, DNS to LAN addresses is still dropped: name lookups go through the tunnel or
+    /// nowhere. Otherwise a resolv.conf rewritten behind our back (DHCP), or the original one while a
+    /// failure or a permanent kill switch blocks, sends queries to the router, and musl asks every nameserver
+    /// at once. These resolvers are exempt (custom DNS, an imported config's DNS), and so are the system
+    /// resolvers while an API window is open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_allowed: Vec<IpAddr>,
 }
 
 /// A temporary hole for the Proton API: HTTPS to its addresses, and DNS to resolve them.
@@ -66,7 +73,7 @@ pub struct ApiAccess {
 impl Rules {
     /// The rules for a permanent kill switch while disconnected: no endpoint, no API.
     pub fn disconnected(&self) -> Self {
-        Self { allow_lan: self.allow_lan, ipv6: false, endpoint: None, api: None }
+        Self { allow_lan: self.allow_lan, ..Self::default() }
     }
 }
 
@@ -76,6 +83,22 @@ pub fn ruleset(rules: &Rules) -> String {
     let mut input = vec!["iifname \"lo\" accept".to_string()];
     let mut forward = Vec::new();
 
+    // DNS outside the tunnel stays blocked even with the LAN allowed (see `dns_allowed`).
+    let lan_dns_blocked = rules.allow_lan;
+    // Only LAN resolvers need the exemption (the rest goes through the tunnel), and 10.2.0.1 never leaves it.
+    let api_resolvers = rules.api.iter().flat_map(|api| &api.resolvers);
+    let (exempt_v4, exempt_v6): (Vec<IpAddr>, Vec<IpAddr>) = rules
+        .dns_allowed
+        .iter()
+        .chain(api_resolvers)
+        .filter(|a| is_lan(a) && **a != IpAddr::V4(SERVER_ADDRESS_V4))
+        .partition(|a| a.is_ipv4());
+    if lan_dns_blocked {
+        if !exempt_v6.is_empty() {
+            output.push(format!("ip6 daddr {{ {} }} meta l4proto {{ tcp, udp }} th dport 53 accept", join(&exempt_v6)));
+        }
+        output.push(format!("ip6 daddr {{ {LAN_V6} }} meta l4proto {{ tcp, udp }} th dport 53 counter drop"));
+    }
     if rules.allow_lan {
         // Before the IPv6 drop below: the LAN stays reachable over IPv6 even without IPv6 in the tunnel.
         output.push(format!("ip6 daddr {{ {LAN_V6} }} accept"));
@@ -126,6 +149,15 @@ pub fn ruleset(rules: &Rules) -> String {
         }
     }
     if rules.allow_lan {
+        if lan_dns_blocked {
+            if !exempt_v4.is_empty() {
+                output.push(format!(
+                    "ip daddr {{ {} }} meta l4proto {{ tcp, udp }} th dport 53 accept",
+                    join(&exempt_v4)
+                ));
+            }
+            output.push(format!("ip daddr {{ {LAN_V4} }} meta l4proto {{ tcp, udp }} th dport 53 counter drop"));
+        }
         output.push(format!("ip daddr {{ {LAN_V4} }} accept"));
         input.push(format!("ip saddr {{ {LAN_V4} }} accept"));
     }
@@ -196,6 +228,17 @@ fn chain(name: &str, hook: &str, rules: &[String]) -> String {
     text
 }
 
+/// Whether `ip` is in the ranges "allow LAN" opens ([`LAN_V4`], [`LAN_V6`]).
+fn is_lan(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast(),
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            first & 0xffc0 == 0xfe80 || first & 0xfe00 == 0xfc00 || v6.is_multicast()
+        }
+    }
+}
+
 fn join(addresses: &[IpAddr]) -> String {
     addresses.iter().map(IpAddr::to_string).collect::<Vec<_>>().join(", ")
 }
@@ -259,14 +302,10 @@ pub async fn open_api_window(rules: &Rules, host: &str) -> Result<()> {
     apply(&with_dns).await
 }
 
-/// Non-loopback `nameserver`s in a resolv.conf. Empty when the resolver is a local stub (or unknown).
+/// Non-loopback `nameserver`s in a resolv.conf (without scope ids, which nft doesn't take). Empty when the
+/// resolver is a local stub (or unknown).
 fn system_resolvers(resolv_conf: &str) -> Vec<IpAddr> {
-    let servers: Vec<IpAddr> = resolv_conf
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        // Drop a scope id (fe80::1%eth0): nft doesn't take it.
-        .filter_map(|s| s.trim().split('%').next()?.parse().ok())
-        .collect();
+    let servers = crate::vpn::dns::nameservers(resolv_conf);
     if servers.iter().any(IpAddr::is_loopback) { Vec::new() } else { servers }
 }
 
@@ -296,20 +335,28 @@ pub async fn delete_table(family: &str, name: &str) -> Result<()> {
     nft_apply(&format!("table {family} {name} {{}}\ndelete table {family} {name}\n")).await.map(drop)
 }
 
-/// Deletes every nftables table protontui created.
-pub async fn recover() -> Result<Vec<String>> {
+/// protontui's installed nftables tables as `(family, name)`, or `None` when there's no `nft` binary.
+pub async fn installed_tables() -> Result<Option<Vec<(String, String)>>> {
     let output = match Command::new("nft").args(["list", "tables"]).output().await {
         Ok(output) => output,
-        // No nft binary means no kill switch could have been installed.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context("running nft"),
     };
     if !output.status.success() {
         bail!("nft list tables: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(Some(our_tables(&listing).into_iter().map(|(f, n)| (f.to_owned(), n.to_owned())).collect()))
+}
 
+/// Deletes every nftables table protontui created.
+pub async fn recover() -> Result<Vec<String>> {
+    // No nft binary means no kill switch could have been installed.
+    let Some(tables) = installed_tables().await? else {
+        return Ok(Vec::new());
+    };
     let mut actions = Vec::new();
-    for (family, name) in our_tables(&String::from_utf8_lossy(&output.stdout)) {
+    for (family, name) in &tables {
         let status = Command::new("nft").args(["delete", "table", family, name]).status().await?;
         if !status.success() {
             bail!("nft delete table {family} {name} failed ({status})");
@@ -350,8 +397,7 @@ mod tests {
 
     #[test]
     fn connecting_ruleset() {
-        let rules =
-            Rules { allow_lan: false, ipv6: true, endpoint: Some("185.159.157.1:443".parse().unwrap()), api: None };
+        let rules = Rules { ipv6: true, endpoint: Some("185.159.157.1:443".parse().unwrap()), ..Rules::default() };
         let script = ruleset(&rules);
         assert!(script.starts_with("table inet protontui {}\ndelete table inet protontui\ntable inet protontui {\n"));
         let output = chain_body(&script, "output");
@@ -381,7 +427,7 @@ mod tests {
 
     #[test]
     fn ipv6_off_drops_ipv6_except_lan() {
-        let script = ruleset(&Rules { allow_lan: true, ipv6: false, endpoint: None, api: None });
+        let script = ruleset(&Rules { allow_lan: true, ..Rules::default() });
         let output = chain_body(&script, "output");
         let lan6 = output.find("ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } accept").unwrap();
         let drop6 = output.find("meta nfproto ipv6 counter drop").unwrap();
@@ -397,6 +443,42 @@ mod tests {
             "{forward}"
         );
         assert!(!script.contains("udp dport 443"), "no endpoint while disconnected");
+    }
+
+    #[test]
+    fn lan_dns_is_dropped_while_connected() {
+        let rules = Rules {
+            allow_lan: true,
+            ipv6: true,
+            endpoint: Some("185.159.157.1:443".parse().unwrap()),
+            dns_allowed: vec!["192.168.1.53".parse().unwrap(), "9.9.9.9".parse().unwrap(), "10.2.0.1".parse().unwrap()],
+            ..Rules::default()
+        };
+        let output = chain_body(&ruleset(&rules), "output").to_owned();
+        let exempt = output.find("ip daddr { 192.168.1.53 } meta l4proto { tcp, udp } th dport 53 accept").unwrap();
+        let drop6 = output
+            .find("ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } meta l4proto { tcp, udp } th dport 53 counter drop")
+            .unwrap();
+        let lan6 = output.find("ip6 daddr { fe80::/10, fc00::/7, ff00::/8 } accept").unwrap();
+        let drop4 = output.find("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta l4proto { tcp, udp } th dport 53 counter drop").unwrap();
+        let lan4 = output.find("255.255.255.255 } accept").unwrap();
+        assert!(drop6 < lan6 && exempt < drop4 && drop4 < lan4, "{output}");
+        // Public resolvers go through the tunnel; an accept would let them past the kill switch when it's down.
+        assert!(!output.contains("9.9.9.9") && !output.contains("{ 10.2.0.1 }"), "{output}");
+        assert!(output.find("ip daddr 10.2.0.1 counter drop").unwrap() < exempt);
+        // Disconnected (a permanent kill switch, or after a failure): still no DNS to the LAN, except the system
+        // resolvers while the API window is open.
+        let idle = ruleset(&Rules { endpoint: None, dns_allowed: vec![], ..rules });
+        assert!(chain_body(&idle, "output").contains("dport 53 counter drop"));
+        assert!(!idle.contains("192.168.1.53"));
+        let api = ApiAccess { addresses: vec![], resolvers: vec!["fe80::1".parse().unwrap()] };
+        let window = ruleset(&Rules { allow_lan: true, api: Some(api), ..Rules::default() });
+        let output = chain_body(&window, "output");
+        assert!(
+            output.find("ip6 daddr { fe80::1 } meta l4proto { tcp, udp } th dport 53 accept").unwrap()
+                < output.find("dport 53 counter drop").unwrap(),
+            "{output}"
+        );
     }
 
     #[test]
@@ -423,8 +505,9 @@ mod tests {
             ipv6: true,
             endpoint: Some("1.2.3.4:51820".parse().unwrap()),
             api: Some(ApiAccess::default()),
+            dns_allowed: vec!["192.168.1.53".parse().unwrap()],
         };
-        assert_eq!(rules.disconnected(), Rules { allow_lan: true, ipv6: false, endpoint: None, api: None });
+        assert_eq!(rules.disconnected(), Rules { allow_lan: true, ..Rules::default() });
         // The API hole is never written to the state record.
         let json = serde_json::to_string(&rules).unwrap();
         assert!(!json.contains("api"));

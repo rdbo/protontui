@@ -88,6 +88,11 @@ pub enum Request {
     ConnectWgConfig {
         name: String,
     },
+    /// Connects with a profile from the settings (T6.2). Profiles are added, changed and removed through
+    /// [`Request::SetSettings`].
+    ConnectProfile {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

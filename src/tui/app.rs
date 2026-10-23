@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::{self, KillSwitchMode, Settings};
+use crate::config::{self, AutoConnect, ConnectTarget, Destination, KillSwitchMode, Profile, Settings};
 use crate::ipc::{ErrorKind, Event, IpcError, LoginReply, Request, Response, ServerFilter};
 use crate::servers::select::{self, Intent};
 use crate::session::AccountInfo;
@@ -183,6 +183,9 @@ pub enum ModalKind {
     ConfirmDelete(String),
     /// Import a config from the Home screen.
     Import,
+    /// Save a destination as a new profile; the input is its name.
+    NewProfile(Destination),
+    ConfirmDeleteProfile(String),
 }
 
 pub struct Modal {
@@ -310,6 +313,7 @@ impl App {
             index: self.servers.as_ref(),
             favourites: &settings.favourites,
             recents: &settings.recents,
+            profiles: &settings.profiles,
             configs: &self.configs,
             signed_in: self.signed_in(),
         };
@@ -835,6 +839,7 @@ impl App {
                     index: self.servers.as_ref(),
                     favourites: &settings.favourites,
                     recents: &settings.recents,
+                    profiles: &settings.profiles,
                     configs: &self.configs,
                     signed_in: self.username.is_some(),
                 };
@@ -858,6 +863,26 @@ impl App {
             KeyCode::Char('f') => return self.toggle_favourite(),
             KeyCode::Char('i') => {
                 self.modal = Some(Modal { kind: ModalKind::Import, input: TextInput::default(), error: None });
+            }
+            KeyCode::Char('p') if self.signed_in() => {
+                let profiles = self.settings.as_ref().map(|s| s.profiles.as_slice()).unwrap_or_default();
+                match self.browser.destination(self.servers.as_ref(), profiles) {
+                    Some(Destination { target: ConnectTarget::Profile { .. }, .. }) | None => {
+                        self.toast(Level::Info, "Select a country, city or server to save as a profile");
+                    }
+                    Some(destination) => {
+                        let input = TextInput::with_value(&target_label(&destination, self.servers.as_ref()));
+                        self.modal = Some(Modal { kind: ModalKind::NewProfile(destination), input, error: None });
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Delete if self.browser.tab == Tab::Profiles => {
+                if let Some(Row::Profile(i)) = self.browser.selected_row()
+                    && let Some(profile) = self.settings.as_ref().and_then(|s| s.profiles.get(*i))
+                {
+                    let kind = ModalKind::ConfirmDeleteProfile(profile.name.clone());
+                    self.modal = Some(Modal { kind, input: Default::default(), error: None });
+                }
             }
             KeyCode::Char('x') | KeyCode::Delete if self.browser.tab == Tab::Configs => {
                 if let Some(Row::Config(i)) = self.browser.selected_row()
@@ -889,8 +914,15 @@ impl App {
     }
 
     fn connect_selected(&mut self) -> Vec<Command> {
-        match self.browser.action(self.servers.as_ref(), &self.configs) {
+        let profiles = self.settings.as_ref().map(|s| s.profiles.as_slice()).unwrap_or_default();
+        match self.browser.action(self.servers.as_ref(), profiles, &self.configs) {
             Some(Action::ConnectConfig(name)) => vec![self.send(Tag::Connect, Request::ConnectWgConfig { name })],
+            Some(Action::ConnectProfile(name)) => {
+                if self.free_plan() {
+                    self.toast(Level::Info, "Free plan: connecting to the fastest free server");
+                }
+                vec![self.send(Tag::Connect, Request::ConnectProfile { name })]
+            }
             Some(Action::Connect(request)) => {
                 if let Some(message) = self.locked_message(&request) {
                     self.toast(Level::Warning, message);
@@ -931,8 +963,10 @@ impl App {
     }
 
     fn toggle_favourite(&mut self) -> Vec<Command> {
-        let Some(target) = self.browser.favourite_target(self.servers.as_ref()) else { return Vec::new() };
         let Some(mut settings) = self.settings.clone() else { return Vec::new() };
+        let Some(target) = self.browser.destination(self.servers.as_ref(), &settings.profiles) else {
+            return Vec::new();
+        };
         let label = target_label(&target, self.servers.as_ref());
         if let Some(at) = settings.favourites.iter().position(|t| *t == target) {
             settings.favourites.remove(at);
@@ -1083,6 +1117,61 @@ impl App {
                     modal.input.handle(key);
                     Vec::new()
                 }
+            },
+            ModalKind::NewProfile(destination) => match key.code {
+                KeyCode::Esc => {
+                    self.modal = None;
+                    Vec::new()
+                }
+                KeyCode::Enter => {
+                    let profile = Profile::new(modal.input.value().trim(), destination);
+                    let Some(mut settings) = self.settings.clone() else { return Vec::new() };
+                    if let Err(e) = profile.validate() {
+                        modal.error = Some(format!("{e:#}"));
+                        return Vec::new();
+                    }
+                    if settings.profile(&profile.name).is_some() {
+                        modal.error = Some(format!("There's a profile named {:?} already", profile.name));
+                        return Vec::new();
+                    }
+                    self.modal = None;
+                    self.toast(
+                        Level::Info,
+                        format!(
+                            "Saved profile {:?}; protontui profile set changes its port and features",
+                            profile.name
+                        ),
+                    );
+                    settings.profiles.push(profile);
+                    self.set_settings(settings)
+                }
+                _ => {
+                    modal.input.handle(key);
+                    modal.error = None;
+                    Vec::new()
+                }
+            },
+            ModalKind::ConfirmDeleteProfile(name) => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.modal = None;
+                    let Some(mut settings) = self.settings.clone() else { return Vec::new() };
+                    settings.profiles.retain(|p| p.name != name);
+                    let target = ConnectTarget::Profile { name: name.clone() };
+                    settings.favourites.retain(|d| d.target != target);
+                    settings.recents.retain(|d| d.target != target);
+                    if settings.auto_connect == AutoConnect::Profile(name.clone()) {
+                        settings.auto_connect = AutoConnect::Off;
+                        self.toast(Level::Warning, format!("Deleted {name:?}; auto-connect is off now"));
+                    } else {
+                        self.toast(Level::Info, format!("Deleted profile {name:?}"));
+                    }
+                    self.set_settings(settings)
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.modal = None;
+                    Vec::new()
+                }
+                _ => Vec::new(),
             },
         }
     }
@@ -1306,7 +1395,7 @@ mod tests {
         let Some(Command::Send(Tag::SetSettings, Request::SetSettings { settings })) = commands.first() else {
             panic!()
         };
-        assert_eq!(settings.favourites, [crate::config::ConnectTarget::Country { code: "CH".into() }]);
+        assert_eq!(settings.favourites, [ConnectTarget::Country { code: "CH".into() }.into()]);
         app.update(key(KeyCode::Char('f')));
         assert!(app.settings.as_ref().unwrap().favourites.is_empty(), "toggled off again");
 
@@ -1318,6 +1407,43 @@ mod tests {
         app.update(key(KeyCode::Esc));
         assert!(!app.typing());
         assert_eq!(app.browser.query(), "");
+    }
+
+    #[test]
+    fn profiles_from_the_browser() {
+        let mut app = linked(Some("alice"));
+        app.update(Msg::Reply(Tag::Servers, Ok(listing(2))));
+        // p on Switzerland: a name prompt prefilled with the label.
+        app.update(key(KeyCode::Char('p')));
+        assert!(matches!(&app.modal, Some(Modal { kind: ModalKind::NewProfile(_), .. })));
+        assert_eq!(app.modal.as_ref().unwrap().input.value(), "Switzerland");
+        for _ in 0.."Switzerland".len() {
+            app.update(key(KeyCode::Backspace));
+        }
+        app.update(key(KeyCode::Enter));
+        assert!(app.modal.as_ref().unwrap().error.is_some(), "an empty name is refused");
+        type_text(&mut app, "work");
+        let commands = app.update(key(KeyCode::Enter));
+        let Some(Command::Send(Tag::SetSettings, Request::SetSettings { settings })) = commands.first() else {
+            panic!()
+        };
+        assert_eq!(settings.profiles, [Profile::new("work", ConnectTarget::Country { code: "CH".into() }.into())]);
+        assert!(app.modal.is_none());
+
+        app.browser.set_tab(Tab::Profiles);
+        app.rebuild_browser();
+        assert_eq!(app.browser.rows, [Row::Profile(0)]);
+        let commands = app.update(key(KeyCode::Enter));
+        assert!(matches!(
+            commands.first(),
+            Some(Command::Send(Tag::Connect, Request::ConnectProfile { name })) if name == "work"
+        ));
+        app.update(key(KeyCode::Char('x')));
+        let commands = app.update(key(KeyCode::Char('y')));
+        let Some(Command::Send(Tag::SetSettings, Request::SetSettings { settings })) = commands.first() else {
+            panic!()
+        };
+        assert!(settings.profiles.is_empty());
     }
 
     #[test]

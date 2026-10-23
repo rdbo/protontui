@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
 use protontui::api::{self, ApiClient};
-use protontui::config::{AutoConnect, KillSwitchMode, NetShield, Paths, Settings};
+use protontui::config::{AutoConnect, ConnectTarget, Destination, KillSwitchMode, NetShield, Paths, Profile, Settings};
 use protontui::ipc::{
     self, Client, ErrorKind, Event as IpcEvent, IpcError, LoginReply, Request as IpcRequest, Response,
 };
@@ -49,9 +49,15 @@ enum Command {
         #[arg(long, value_enum)]
         feature: Option<Feature>,
         /// An imported WireGuard config (see `import`); needs no login.
-        #[arg(long, conflicts_with_all = ["country", "server", "feature"])]
+        #[arg(long, conflicts_with_all = ["country", "server", "feature", "profile"])]
         config: Option<String>,
+        /// A profile (see `profile`).
+        #[arg(long, conflicts_with_all = ["country", "server", "feature"])]
+        profile: Option<String>,
     },
+    /// Named profiles: where to connect, with which port and connection features.
+    #[command(subcommand)]
+    Profile(ProfileCommand),
     /// Import a WireGuard .conf file (e.g. downloaded from account.proton.me) to connect without logging in.
     Import {
         file: std::path::PathBuf,
@@ -83,7 +89,7 @@ enum Command {
     /// Show the settings, or change one: `protontui config kill-switch standard`.
     Config {
         /// kill-switch, allow-lan, netshield, vpn-accelerator, moderate-nat, port-forwarding, ipv6,
-        /// custom-dns, auto-connect.
+        /// custom-dns, alternative-routing, auto-connect.
         key: Option<String>,
         value: Option<String>,
     },
@@ -112,6 +118,66 @@ enum Command {
         #[arg(long)]
         endpoint: Option<std::net::SocketAddrV4>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List the profiles.
+    List,
+    /// Add a profile: `protontui profile add work --country CH --feature p2p --netshield 2`.
+    Add {
+        name: String,
+        #[command(flatten)]
+        options: ProfileOptions,
+    },
+    /// Change a profile: only the options given change; `default` puts a feature back to the global setting.
+    Set {
+        name: String,
+        #[command(flatten)]
+        options: ProfileOptions,
+    },
+    /// Delete a profile.
+    Remove { name: String },
+}
+
+#[derive(clap::Args)]
+struct ProfileOptions {
+    /// The fastest server (the default for a new profile).
+    #[arg(long, conflicts_with_all = ["country", "server", "secure_core"])]
+    fastest: bool,
+    /// Fastest server in this country (with --secure-core: the exit country).
+    #[arg(long)]
+    country: Option<String>,
+    /// A city in --country.
+    #[arg(long, requires = "country", conflicts_with = "secure_core")]
+    city: Option<String>,
+    /// A specific server, e.g. CH#10.
+    #[arg(long, conflicts_with_all = ["country", "secure_core"])]
+    server: Option<String>,
+    /// Secure Core (into --country, through --entry; either may be left out).
+    #[arg(long)]
+    secure_core: bool,
+    /// Secure Core entry country.
+    #[arg(long, requires = "secure_core")]
+    entry: Option<String>,
+    /// Only servers with this feature.
+    #[arg(long, value_enum)]
+    feature: Option<Feature>,
+    /// WireGuard UDP port, or `default`.
+    #[arg(long)]
+    port: Option<String>,
+    /// 0, 1, 2 or `default`.
+    #[arg(long)]
+    netshield: Option<String>,
+    /// on, off or `default`.
+    #[arg(long)]
+    vpn_accelerator: Option<String>,
+    /// on, off or `default`.
+    #[arg(long)]
+    moderate_nat: Option<String>,
+    /// on, off or `default`.
+    #[arg(long)]
+    port_forwarding: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -159,7 +225,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             standalone::connect(Target::WgConfig(name)).await
         }
         Some(Command::Connect { config: Some(name), .. }) => connect_wg_config(name).await,
-        Some(Command::Connect { country, server, feature, config: None }) => {
+        Some(Command::Connect { profile: Some(name), .. }) if standalone => {
+            let settings = Settings::load(&Paths::detect()?.settings_file())?;
+            let profile = settings.profile(&name).with_context(|| format!("no profile named {name:?}"))?;
+            standalone::connect(Target::Profile(profile.clone())).await
+        }
+        Some(Command::Connect { profile: Some(name), .. }) => connect_profile(name).await,
+        Some(Command::Profile(command)) => profile(standalone, command).await,
+        Some(Command::Connect { country, server, feature, config: None, profile: None }) => {
             let request = connect_request(country, server, feature);
             if standalone { standalone::connect(Target::Proton(request)).await } else { connect(request).await }
         }
@@ -182,10 +255,18 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             standalone::export_config(connect_request(country, server, None), output).await
         }
         Some(Command::KillSwitchRules { allow_lan, ipv6, endpoint }) => {
-            print!("{}", killswitch::ruleset(&killswitch::Rules { allow_lan, ipv6, endpoint, api: None }));
+            print!("{}", killswitch::ruleset(&killswitch::Rules { allow_lan, ipv6, endpoint, ..Default::default() }));
             print!("{}", killswitch::ipv6_leak_ruleset());
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn feature_filter(feature: Feature) -> FeatureFilter {
+    match feature {
+        Feature::P2p => FeatureFilter::P2P,
+        Feature::Tor => FeatureFilter::Tor,
+        Feature::Streaming => FeatureFilter::Streaming,
     }
 }
 
@@ -197,11 +278,7 @@ fn connect_request(country: Option<String>, server: Option<String>, feature: Opt
     };
     let mut request = Request::new(intent);
     if let Some(feature) = feature {
-        request = request.with_feature(match feature {
-            Feature::P2p => FeatureFilter::P2P,
-            Feature::Tor => FeatureFilter::Tor,
-            Feature::Streaming => FeatureFilter::Streaming,
-        });
+        request = request.with_feature(feature_filter(feature));
     }
     request
 }
@@ -522,12 +599,172 @@ async fn follow_connection(
     }
 }
 
+async fn connect_profile(name: String) -> Result<ExitCode> {
+    let client = client().await?;
+    let mut events = client.events().context("event stream")?;
+    client.call(IpcRequest::Subscribe).await?;
+    client.call(IpcRequest::ConnectProfile { name }).await?;
+    follow_connection(&client, &mut events).await
+}
+
 async fn connect_wg_config(name: String) -> Result<ExitCode> {
     let client = client().await?;
     let mut events = client.events().context("event stream")?;
     client.call(IpcRequest::Subscribe).await?;
     client.call(IpcRequest::ConnectWgConfig { name }).await?;
     follow_connection(&client, &mut events).await
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------------------------------------
+
+async fn profile(standalone: bool, command: ProfileCommand) -> Result<ExitCode> {
+    let client = if standalone { None } else { Some(client().await?) };
+    let paths = Paths::detect()?;
+    let mut settings = match &client {
+        Some(client) => match client.call(IpcRequest::GetSettings).await? {
+            Response::Settings { settings } => settings,
+            other => bail!("unexpected answer from the daemon: {other:?}"),
+        },
+        None => Settings::load(&paths.settings_file())?,
+    };
+    let changed = match command {
+        ProfileCommand::List => {
+            if settings.profiles.is_empty() {
+                println!("No profiles. Add one with `protontui profile add NAME --country CC`.");
+            }
+            for profile in &settings.profiles {
+                let auto = settings.auto_connect == AutoConnect::Profile(profile.name.clone());
+                println!("{}{}", describe_profile(profile), if auto { "  (auto-connect)" } else { "" });
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        ProfileCommand::Add { name, options } => {
+            if settings.profile(&name).is_some() {
+                bail!("there's a profile named {name:?} already; change it with `protontui profile set`");
+            }
+            let mut profile = Profile::new(name, ConnectTarget::Fastest.into());
+            apply_profile_options(&mut profile, options)?;
+            profile.validate()?;
+            println!("Added {}", describe_profile(&profile));
+            settings.profiles.push(profile);
+            true
+        }
+        ProfileCommand::Set { name, options } => {
+            let profile = settings
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == name)
+                .with_context(|| format!("no profile named {name:?}"))?;
+            apply_profile_options(profile, options)?;
+            profile.validate()?;
+            println!("Changed {}", describe_profile(profile));
+            true
+        }
+        ProfileCommand::Remove { name } => {
+            let before = settings.profiles.len();
+            settings.profiles.retain(|p| p.name != name);
+            if settings.profiles.len() == before {
+                bail!("no profile named {name:?}");
+            }
+            let target = ConnectTarget::Profile { name: name.clone() };
+            settings.favourites.retain(|d| d.target != target);
+            settings.recents.retain(|d| d.target != target);
+            if settings.auto_connect == AutoConnect::Profile(name.clone()) {
+                settings.auto_connect = AutoConnect::Off;
+                println!("Auto-connect pointed at it and is off now.");
+            }
+            println!("Deleted profile {name}.");
+            true
+        }
+    };
+    if changed {
+        match &client {
+            Some(client) => {
+                client.call(IpcRequest::SetSettings { settings }).await?;
+            }
+            None => settings.save(&paths.settings_file())?,
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Changes what the options name; a target option replaces the whole target.
+fn apply_profile_options(profile: &mut Profile, options: ProfileOptions) -> Result<()> {
+    let upper = |code: String| code.to_ascii_uppercase();
+    let target = if options.fastest {
+        Some(ConnectTarget::Fastest)
+    } else if options.secure_core {
+        Some(ConnectTarget::SecureCore { exit: options.country.map(upper), entry: options.entry.map(upper) })
+    } else if let Some(name) = options.server {
+        Some(ConnectTarget::Server { name: name.to_ascii_uppercase() })
+    } else if let Some(code) = options.country {
+        Some(match options.city {
+            Some(city) => ConnectTarget::City { country: upper(code), city },
+            None => ConnectTarget::Country { code: upper(code) },
+        })
+    } else {
+        None
+    };
+    let feature = options.feature.map(feature_filter);
+    match target {
+        Some(target) => profile.target = Destination { target, feature },
+        None if feature.is_some() => profile.target.feature = feature,
+        None => {}
+    }
+    if let Some(port) = options.port {
+        profile.port = match port.as_str() {
+            "default" => None,
+            port => Some(port.parse().with_context(|| format!("{port:?} isn't a port number"))?),
+        };
+    }
+    if let Some(level) = options.netshield {
+        profile.netshield = match level.as_str() {
+            "default" => None,
+            "0" | "off" => Some(NetShield::Off),
+            "1" | "malware" => Some(NetShield::Malware),
+            "2" | "ads" | "all" => Some(NetShield::AdsTrackersMalware),
+            _ => bail!("--netshield takes 0, 1, 2 or default"),
+        };
+    }
+    for (value, field, flag) in [
+        (options.vpn_accelerator, &mut profile.vpn_accelerator, "--vpn-accelerator"),
+        (options.moderate_nat, &mut profile.moderate_nat, "--moderate-nat"),
+        (options.port_forwarding, &mut profile.port_forwarding, "--port-forwarding"),
+    ] {
+        if let Some(value) = value {
+            *field = match value.as_str() {
+                "default" => None,
+                "on" | "true" | "yes" | "1" => Some(true),
+                "off" | "false" | "no" | "0" => Some(false),
+                _ => bail!("{flag} takes on, off or default"),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// `work: Switzerland · P2P, port 443, NetShield 2, port forwarding on`.
+fn describe_profile(profile: &Profile) -> String {
+    let mut parts = vec![protontui::tui::browser::target_label(&profile.target, None)];
+    if let Some(port) = profile.port {
+        parts.push(format!("port {port}"));
+    }
+    if let Some(level) = profile.netshield {
+        parts.push(format!("NetShield {}", level.level()));
+    }
+    let on = |v: bool| if v { "on" } else { "off" };
+    for (name, value) in [
+        ("VPN Accelerator", profile.vpn_accelerator),
+        ("Moderate NAT", profile.moderate_nat),
+        ("port forwarding", profile.port_forwarding),
+    ] {
+        if let Some(value) = value {
+            parts.push(format!("{name} {}", on(value)));
+        }
+    }
+    format!("{}: {}", profile.name, parts.join(", "))
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -644,6 +881,7 @@ fn get_setting(settings: &Settings, key: &str) -> Result<String> {
         "moderate-nat" => settings.moderate_nat.to_string(),
         "port-forwarding" => settings.port_forwarding.to_string(),
         "ipv6" => settings.ipv6.to_string(),
+        "alternative-routing" => settings.alternative_routing.to_string(),
         "custom-dns" if settings.custom_dns.enabled => {
             settings.custom_dns.servers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         }
@@ -689,6 +927,7 @@ fn set_setting(settings: &mut Settings, key: &str, value: &str) -> Result<()> {
         "moderate-nat" => settings.moderate_nat = flag()?,
         "port-forwarding" => settings.port_forwarding = flag()?,
         "ipv6" => settings.ipv6 = flag()?,
+        "alternative-routing" => settings.alternative_routing = flag()?,
         "custom-dns" if value == "off" => settings.custom_dns.enabled = false,
         "custom-dns" => {
             let servers = value
@@ -703,7 +942,11 @@ fn set_setting(settings: &mut Settings, key: &str, value: &str) -> Result<()> {
                 "off" => AutoConnect::Off,
                 "fastest" => AutoConnect::Fastest,
                 "last" => AutoConnect::Last,
-                _ => bail!("auto-connect takes off, fastest or last"),
+                _ => match value.strip_prefix("profile:") {
+                    Some(name) if settings.profile(name).is_some() => AutoConnect::Profile(name.to_owned()),
+                    Some(name) => bail!("no profile named {name:?} (`protontui profile list`)"),
+                    None => bail!("auto-connect takes off, fastest, last or profile:NAME"),
+                },
             }
         }
         _ => bail!("unknown setting {key:?}"),
@@ -962,9 +1205,12 @@ mod standalone {
                     "a crashed connection left changes behind; clean them up with `doas protontui --standalone disconnect`"
                 );
             }
-            for action in vpn::engine::cleanup_stale().await? {
+            for action in vpn::engine::cleanup_stale().await?.actions {
                 println!("✓ {action}");
             }
+            // The user disconnects: a standard kill switch the crashed run left goes too.
+            let settings = Settings::load(&Paths::detect()?.settings_file())?;
+            vpn::engine::apply_idle_kill_switch(&settings).await?;
             println!("Disconnected (cleaned up after a crashed run).");
             return Ok(ExitCode::SUCCESS);
         }

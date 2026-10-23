@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Sparkline, Tabs, Wrap};
 
-use crate::config::{ConnectTarget, KillSwitchMode};
+use crate::config::{AutoConnect, ConnectTarget, KillSwitchMode};
 use crate::servers::countries::country_name;
 use crate::servers::model::Features;
 use crate::vpn::engine::{ConnectionState, ServerInfo};
@@ -211,6 +211,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.modal.is_some() {
         return match app.modal.as_ref().map(|m| &m.kind) {
             Some(ModalKind::Import) => vec![("Enter", "import"), ("Esc", "cancel")],
+            Some(ModalKind::NewProfile(_)) => vec![("Enter", "save"), ("Esc", "cancel")],
             _ => vec![("y", "yes"), ("n", "no")],
         };
     }
@@ -233,6 +234,7 @@ fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.extend([("?", "help"), ("/", "search"), ("Tab", "tab"), ("←→", "fold")]);
             if app.signed_in() {
                 hints.push(("f", "favourite"));
+                hints.push(("p", "profile"));
             }
             hints.push(("q", "quit"));
             hints
@@ -551,8 +553,12 @@ fn load_bar(load: u8) -> Vec<Span<'static>> {
     ]
 }
 
-fn is_favourite(app: &App, target: &ConnectTarget) -> bool {
-    app.settings.as_ref().is_some_and(|s| s.favourites.contains(target))
+/// Whether `row` (as the current tab sees it: with its feature, Secure Core) is a favourite.
+fn is_favourite(app: &App, row: &Row) -> bool {
+    let Some(settings) = app.settings.as_ref() else { return false };
+    app.browser
+        .row_destination(row, app.servers.as_ref(), &settings.profiles)
+        .is_some_and(|d| settings.favourites.contains(&d))
 }
 
 fn row_line(app: &App, row: &Row, width: usize) -> Line<'static> {
@@ -566,8 +572,7 @@ fn row_line(app: &App, row: &Row, width: usize) -> Line<'static> {
             let entry = &index.countries[*country];
             let servers = entry.servers_in(app.browser.tab);
             let arrow = if *expanded { "▾" } else { "▸" };
-            let star =
-                if is_favourite(app, &ConnectTarget::Country { code: entry.code.clone() }) { "★" } else { " " };
+            let star = if is_favourite(app, row) { "★" } else { " " };
             let connected = current.is_some_and(|s| s.exit_country == entry.code && s.wg_config.is_none());
             let name_width = width.saturating_sub(24).max(8);
             let mut spans = vec![
@@ -590,8 +595,7 @@ fn row_line(app: &App, row: &Row, width: usize) -> Line<'static> {
             let country = &index.countries[*country];
             let entry = &country.cities[*city];
             let arrow = if *expanded { "▾" } else { "▸" };
-            let target = ConnectTarget::City { country: country.code.clone(), city: entry.name.clone() };
-            let star = if is_favourite(app, &target) { "★" } else { " " };
+            let star = if is_favourite(app, row) { "★" } else { " " };
             let searching = !app.browser.query().is_empty();
             let (indent, name) = if searching {
                 ("  ", format!("{}, {}", entry.name, country.name))
@@ -620,7 +624,7 @@ fn row_line(app: &App, row: &Row, width: usize) -> Line<'static> {
                 _ => "        ",
             };
             let connected = current.is_some_and(|c| c.logical_id == s.id);
-            let star = if is_favourite(app, &ConnectTarget::Server { name: s.name.clone() }) { "★" } else { " " };
+            let star = if is_favourite(app, row) { "★" } else { " " };
             let place = if s.features & Features::SECURE_CORE != 0 {
                 format!("via {}", country_name(&s.entry_country).unwrap_or(&s.entry_country))
             } else if *depth == 0 {
@@ -655,17 +659,35 @@ fn row_line(app: &App, row: &Row, width: usize) -> Line<'static> {
         }
         Row::Target(target) => {
             let label = target_label(target, index);
-            let kind = match target {
+            let kind = match target.target {
                 ConnectTarget::Fastest => "fastest",
                 ConnectTarget::Country { .. } => "country",
                 ConnectTarget::City { .. } => "city",
                 ConnectTarget::Server { .. } => "server",
+                ConnectTarget::SecureCore { .. } => "secure core",
+                ConnectTarget::Profile { .. } => "profile",
             };
-            let star = if is_favourite(app, target) { "★ " } else { "  " };
+            let star = if is_favourite(app, row) { "★ " } else { "  " };
             Line::from(vec![
                 Span::styled(format!("  {star}"), Style::new().fg(WARNING)),
                 Span::styled(pad(&label, width.saturating_sub(16).max(8)), theme::bold()),
                 Span::styled(format!(" {kind}"), theme::weak()),
+            ])
+        }
+        Row::Profile(i) => {
+            let Some(profile) = app.settings.as_ref().and_then(|s| s.profiles.get(*i)) else {
+                return Line::default();
+            };
+            let star = if is_favourite(app, row) { "★ " } else { "  " };
+            let name_width = (width / 3).clamp(8, 24);
+            Line::from(vec![
+                Span::styled(format!("  {star}"), Style::new().fg(WARNING)),
+                Span::styled(pad(&profile.name, name_width), theme::bold()),
+                Span::raw(" "),
+                Span::styled(
+                    pad(&target_label(&profile.target, index), width.saturating_sub(name_width + 6).max(8)),
+                    theme::weak(),
+                ),
             ])
         }
         Row::Config(i) => {
@@ -768,7 +790,36 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         Some(Row::Target(target)) => {
             title = target_label(target, index);
             lines.push(Line::from(Span::styled(" Enter connects", theme::weak())));
-            lines.push(Line::from(Span::styled(" f removes it from favourites", theme::weak())));
+            lines.push(Line::from(Span::styled(" f toggles it as a favourite", theme::weak())));
+        }
+        Some(row @ Row::Profile(i)) if app.settings.as_ref().is_some_and(|s| s.profiles.len() > *i) => {
+            let settings = app.settings.as_ref().unwrap();
+            let profile = &settings.profiles[*i];
+            title = profile.name.clone();
+            lines.push(kv("Connects to", target_label(&profile.target, index)));
+            lines.push(kv("Port", profile.port.map_or("default (443, then 88)".into(), |p| format!("UDP {p}"))));
+            let global = |on: bool| if on { "on" } else { "off" };
+            let netshield = match profile.netshield {
+                Some(level) => format!("level {}", level.level()),
+                None => "as in Settings".into(),
+            };
+            lines.push(kv("NetShield", netshield));
+            for (key, value) in [
+                ("Accelerator", profile.vpn_accelerator),
+                ("Mod. NAT", profile.moderate_nat),
+                ("Port fwd.", profile.port_forwarding),
+            ] {
+                lines.push(kv(key, value.map_or("as in Settings".into(), |v| global(v).to_owned())));
+            }
+            if settings.auto_connect == AutoConnect::Profile(profile.name.clone()) {
+                lines.push(kv("At start", "auto-connects here"));
+            }
+            let star = if is_favourite(app, row) { "f: unfavourite" } else { "f: favourite" };
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(" Enter connects · {star} · x deletes · protontui profile set {} … changes it", profile.name),
+                theme::weak(),
+            )));
         }
         Some(Row::Config(i)) if app.configs.get(*i).is_some() => {
             let config = &app.configs[*i];
@@ -991,7 +1042,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let block = theme::panel("Settings", true);
     let inner = block.inner(left);
     frame.render_widget(block, left);
-    let label_width = 18;
+    // The longest label plus two spaces.
+    let label_width = settings_model::items().map(|i| i.label().chars().count()).max().unwrap_or(16) + 2;
     let mut items = Vec::new();
     let mut selected_line = 0;
     for (group, group_items) in settings_model::GROUPS {
@@ -1179,7 +1231,8 @@ fn draw_help(frame: &mut Frame, _app: &App, area: Rect) {
                 ("Enter", "connect to the selection"),
                 ("/", "search; Esc clears"),
                 ("f", "favourite on/off"),
-                ("i / x", "import / delete a WireGuard config"),
+                ("p", "save the selection as a profile"),
+                ("i / x", "import a WireGuard config / delete one"),
                 ("y", "copy the forwarded port (or exit IP)"),
                 ("r", "refresh the server list"),
             ],
@@ -1214,6 +1267,28 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
         ModalKind::ConfirmDelete(name) => {
             ("Delete config?", vec![Line::from(format!("Delete the WireGuard config {name:?} and its key?"))])
         }
+        ModalKind::ConfirmDeleteProfile(name) => {
+            ("Delete profile?", vec![Line::from(format!("Delete the profile {name:?}?"))])
+        }
+        ModalKind::NewProfile(destination) => {
+            let mut line = modal.input.line(inner_width.saturating_sub(2), true, "");
+            line.spans.insert(0, Span::styled("› ", theme::accent()));
+            let mut lines = vec![
+                Line::from(Span::styled("Name:", theme::bold())),
+                line,
+                Line::default(),
+                Line::from(Span::styled(
+                    format!("Connects to {}.", target_label(destination, app.servers.as_ref())),
+                    theme::weak(),
+                )),
+            ];
+            if let Some(error) = &modal.error {
+                for chunk in wrap(error, inner_width) {
+                    lines.push(Line::from(Span::styled(chunk, Style::new().fg(DANGER))));
+                }
+            }
+            ("New profile", lines)
+        }
         ModalKind::Import => {
             let mut line = modal.input.line(inner_width.saturating_sub(2), true, "");
             line.spans.insert(0, Span::styled("› ", theme::accent()));
@@ -1234,7 +1309,7 @@ fn draw_modal(frame: &mut Frame, app: &App, area: Rect) {
             ("Import WireGuard config", lines)
         }
     };
-    if modal.kind != ModalKind::Import {
+    if !matches!(modal.kind, ModalKind::Import | ModalKind::NewProfile(_)) {
         lines.push(Line::default());
         lines.push(Line::from(vec![
             Span::styled(" y ", theme::pill(DANGER)),

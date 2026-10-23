@@ -15,12 +15,13 @@ pub enum Item {
     VpnAccelerator,
     ModerateNat,
     PortForwarding,
+    AlternativeRouting,
 }
 
 pub const GROUPS: [(&str, &[Item]); 3] = [
     ("Connection", &[Item::AutoConnect]),
     ("Privacy", &[Item::KillSwitch, Item::AllowLan, Item::NetShield, Item::CustomDns, Item::DnsServers, Item::Ipv6]),
-    ("Advanced", &[Item::VpnAccelerator, Item::ModerateNat, Item::PortForwarding]),
+    ("Advanced", &[Item::VpnAccelerator, Item::ModerateNat, Item::PortForwarding, Item::AlternativeRouting]),
 ];
 
 /// Every item, in screen order.
@@ -54,13 +55,15 @@ impl Item {
             Item::VpnAccelerator => "VPN Accelerator",
             Item::ModerateNat => "Moderate NAT",
             Item::PortForwarding => "Port forwarding",
+            Item::AlternativeRouting => "Alternative routing",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
             Item::AutoConnect => {
-                "Connect when the daemon starts (at boot): to the fastest server, or to the last one you used."
+                "Connect when the daemon starts (at boot): to the fastest server, the last one you used, or a \
+                 profile (press p on the Home screen to save one)."
             }
             Item::KillSwitch => {
                 "Block internet if VPN drops. Standard: blocks internet if the VPN drops during an active \
@@ -69,7 +72,7 @@ impl Item {
             }
             Item::AllowLan => {
                 "Let local network traffic (printers, file shares, other devices on your LAN) bypass the kill \
-                 switch."
+                 switch. DNS is the exception: name lookups go through the VPN, never to the router."
             }
             Item::NetShield => {
                 "Ad-blocking and malware protection. NetShield blocks malicious and advertising domains at the \
@@ -98,18 +101,23 @@ impl Item {
                 "Port forwarding for P2P. When enabled, a forwarded port is requested when you connect to a \
                  P2P-capable server; protontui keeps the lease renewed and shows the port on the dashboard."
             }
+            Item::AlternativeRouting => {
+                "If the Proton API is blocked on this network, reach it through alternative routes found over \
+                 DNS over HTTPS (Quad9, Google), as the official apps do. Used only while disconnected; not \
+                 through a permanent kill switch."
+            }
         }
     }
 
     /// Available on the Free plan (the CLI's `available_on_free_tier`).
     pub fn free(self) -> bool {
-        matches!(self, Item::AutoConnect | Item::KillSwitch | Item::AllowLan | Item::Ipv6)
+        matches!(self, Item::AutoConnect | Item::KillSwitch | Item::AllowLan | Item::Ipv6 | Item::AlternativeRouting)
     }
 
     pub fn applies(self) -> Applies {
         match self {
             Item::AutoConnect => Applies::NextStart,
-            Item::KillSwitch | Item::AllowLan => Applies::Now,
+            Item::KillSwitch | Item::AllowLan | Item::AlternativeRouting => Applies::Now,
             Item::NetShield | Item::VpnAccelerator | Item::ModerateNat | Item::PortForwarding => Applies::Live,
             Item::CustomDns | Item::DnsServers | Item::Ipv6 => Applies::Reconnect,
         }
@@ -143,6 +151,7 @@ impl Item {
             Item::VpnAccelerator => flag(settings.vpn_accelerator),
             Item::ModerateNat => flag(settings.moderate_nat),
             Item::PortForwarding => flag(settings.port_forwarding),
+            Item::AlternativeRouting => flag(settings.alternative_routing),
         }
     }
 
@@ -150,7 +159,8 @@ impl Item {
     pub fn cycle(self, settings: &mut Settings, forward: bool, tier: u8) -> bool {
         match self {
             Item::AutoConnect => {
-                let order = [AutoConnect::Off, AutoConnect::Fastest, AutoConnect::Last];
+                let mut order = vec![AutoConnect::Off, AutoConnect::Fastest, AutoConnect::Last];
+                order.extend(settings.profiles.iter().map(|p| AutoConnect::Profile(p.name.clone())));
                 let at = order.iter().position(|a| *a == settings.auto_connect).unwrap_or(0);
                 settings.auto_connect = order[step(at, order.len(), forward)].clone();
             }
@@ -172,6 +182,7 @@ impl Item {
             Item::VpnAccelerator => settings.vpn_accelerator = !settings.vpn_accelerator,
             Item::ModerateNat => settings.moderate_nat = !settings.moderate_nat,
             Item::PortForwarding => settings.port_forwarding = !settings.port_forwarding,
+            Item::AlternativeRouting => settings.alternative_routing = !settings.alternative_routing,
         }
         true
     }
@@ -220,13 +231,19 @@ mod tests {
         assert!(!Item::DnsServers.cycle(&mut settings, true, 2));
         Item::AutoConnect.cycle(&mut settings, true, 2);
         assert_eq!(Item::AutoConnect.value(&settings, 2), "Fastest server");
+        settings.profiles.push(crate::config::Profile::new("work", crate::config::ConnectTarget::Fastest.into()));
+        Item::AutoConnect.cycle(&mut settings, true, 2);
+        Item::AutoConnect.cycle(&mut settings, true, 2);
+        assert_eq!(Item::AutoConnect.value(&settings, 2), "Profile work");
+        Item::AutoConnect.cycle(&mut settings, true, 2);
+        assert_eq!(settings.auto_connect, AutoConnect::Off, "wraps after the last profile");
     }
 
     #[test]
     fn gating_and_dns() {
         assert!(Item::KillSwitch.free() && Item::Ipv6.free());
         assert!(!Item::NetShield.free() && !Item::PortForwarding.free() && !Item::CustomDns.free());
-        assert_eq!(items().count(), 10);
+        assert_eq!(items().count(), 11);
         assert_eq!(parse_dns("9.9.9.9, 2620:fe::fe 1.1.1.1").unwrap().len(), 3);
         assert!(parse_dns("9.9.9.9, nope").unwrap_err().contains("nope"));
         assert!(parse_dns("").unwrap().is_empty());

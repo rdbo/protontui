@@ -3065,6 +3065,7 @@ dependencies = [
 [[package]]
 name = "proton-srp"
 version = "0.8.4"
+source = "git+https://github.com/ProtonMail/proton-crypto-rs?rev=c468e282625206eda9b48d539949e6183b1da32a#c468e282625206eda9b48d539949e6183b1da32a"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -3105,6 +3106,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "rtnetlink",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

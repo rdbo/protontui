@@ -1,0 +1,4 @@
+#!/bin/sh
+# Members of this group may use the daemon's socket (/run/protontui.sock, 0660 root:protontui).
+addgroup -S protontui 2>/dev/null
+exit 0

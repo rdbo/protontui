@@ -70,7 +70,7 @@ pub async fn setup(handle: &Handle, index: u32, ipv6: bool) -> Result<()> {
             Err(rtnetlink::Error::NetlinkError(e)) if e.raw_code() == -EAFNOSUPPORT => {}
             Err(e) => return Err(anyhow::Error::from(e).context("adding the IPv6 tunnel route")),
         }
-        if !killswitch::nft_apply(&mark_ruleset(ipv6)).await.context("adding the conntrack mark rules")? {
+        if !apply_mark_rules(ipv6).await? {
             tracing::warn!(
                 "nft not found: with strict reverse-path filtering (rp_filter=1) the tunnel's replies get dropped"
             );
@@ -83,6 +83,11 @@ pub async fn setup(handle: &Handle, index: u32, ipv6: bool) -> Result<()> {
         let _ = killswitch::delete_table("inet", MARK_TABLE).await;
     }
     result
+}
+
+/// Installs (or atomically replaces) [`MARK_TABLE`]. `Ok(false)` when there's no `nft` binary.
+pub async fn apply_mark_rules(ipv6: bool) -> Result<bool> {
+    killswitch::nft_apply(&mark_ruleset(ipv6)).await.context("adding the conntrack mark rules")
 }
 
 /// wg-quick's `premangle`/`postmangle`/`preraw` chains, for both families in one `inet` table. Replaces any

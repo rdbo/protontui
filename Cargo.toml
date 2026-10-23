@@ -17,10 +17,12 @@ genetlink = "0.3.0"
 netlink-packet-core = "0.9.0"
 netlink-packet-generic = "0.5.0"
 netlink-packet-wireguard = "0.5.0"
-nix = { version = "0.31.3", features = ["user", "fs", "hostname", "signal", "process"] }
+nix = { version = "0.31.3", features = ["user", "fs", "hostname", "signal", "process", "inotify"] }
 rand = "0.8.5"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2"] }
 rpassword = "7.5.4"
+# The same rustls reqwest uses; alternative routing (T6.3) hands reqwest a config with a pinning verifier.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rtnetlink = "0.23.0"
 # local-agent-rs calls `TcpKeepalive::with_retries`, which needs socket2's `all` feature but does not
 # enable it (its own Cargo.lock hid that). Enabling it here fixes the build through feature unification.
@@ -39,12 +41,19 @@ zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 # Reads the certificate's start time when the local agent finds it not yet valid (clock skew).
 x509-parser = "0.16.0"
 
-# Proton's own crates, used as path dependencies (see PLAN.md §1).
-proton-srp = { path = "../proton-crypto-rs/proton-srp" }
-local-agent-rs = { path = "../python-proton-vpn-local-agent/local_agent_rs" }
+# Proton's own crates (PLAN.md §1), pinned to the commits of the reference clones next to this repo, so that CI
+# and packaging build the same code without them.
+proton-srp = { git = "https://github.com/ProtonMail/proton-crypto-rs", rev = "c468e282625206eda9b48d539949e6183b1da32a" }
+# Optional (feature `local-agent`, on by default): the crate has no license, so distributable builds may leave
+# it out (`--no-default-features`), losing only live feature changes, port forwarding and NetShield statistics.
+local-agent-rs = { path = "../python-proton-vpn-local-agent/local_agent_rs", optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 fuzzy-matcher = "0.3.7"
+
+[features]
+default = ["local-agent"]
+local-agent = ["dep:local-agent-rs"]
 
 [dev-dependencies]
 curve25519-dalek = "4.1.3"

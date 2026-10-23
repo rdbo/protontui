@@ -6,15 +6,21 @@ name="protontui"
 description="Proton VPN daemon (protontui): WireGuard connection, kill switch and IPC for the TUI"
 command="/usr/local/bin/protontui"
 command_args="daemon"
-command_background=true
-pidfile="/run/${RC_SVCNAME}.pid"
+# supervise-daemon starts the daemon again when it dies (a crash, `kill -9`). The new daemon cleans up after
+# the dead connection; a standard or permanent kill switch keeps blocking meanwhile.
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=10
+respawn_period=300
 # SIGTERM disconnects cleanly (a permanent kill switch stays armed); give the teardown time.
 retry="TERM/30/KILL/5"
 
 depend() {
-	need net
-	use dns logger
+	need localmount
+	# Before the network comes up, so that a permanent kill switch blocks from the first packet on. The daemon
+	# needs no network to start; auto-connect waits for a default route.
+	before net
 	# Firewall services that load a ruleset with `flush ruleset` would wipe the kill switch table: start after
-	# them, so a permanent kill switch is re-armed last.
-	after firewall nftables iptables ip6tables
+	# them. (A firewall reloaded later is caught too: the daemon re-arms its tables within seconds.)
+	after sysctl firewall nftables iptables ip6tables
 }

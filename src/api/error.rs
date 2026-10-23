@@ -38,6 +38,10 @@ pub enum ApiError {
 
     #[error("unexpected API response: {0}")]
     InvalidResponse(String),
+
+    /// Finding or using an alternative route failed (T6.3).
+    #[error("alternative routing: {0}")]
+    AlternativeRouting(String),
 }
 
 impl ApiError {

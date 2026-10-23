@@ -1,0 +1,54 @@
+# Contributor: protontui developers
+# Maintainer:
+pkgname=protontui
+pkgver=0.1.0
+pkgrel=0
+# Proton's local agent crate (no license, so fetched from Proton rather than vendored; see
+# scripts/fetch-local-agent.sh). Must match the commit in that script.
+_localagent=74ec6f4f093805d766f11f9ef522bf1120591058
+pkgdesc="Proton VPN client for the terminal: WireGuard for the whole host, kill switch, TUI"
+url="https://github.com/rdbo/protontui"
+arch="x86_64 aarch64"
+license="GPL-3.0-or-later"
+depends="nftables"
+makedepends="cargo cargo-auditable cmake linux-headers"
+pkggroups="protontui"
+install="$pkgname.pre-install"
+subpackages="$pkgname-openrc $pkgname-doc"
+source="$pkgname-$pkgver.tar.gz::https://github.com/rdbo/protontui/archive/v$pkgver.tar.gz
+	local-agent-rs-$_localagent.tar.gz::https://github.com/ProtonVPN/local-agent-rs/archive/$_localagent.tar.gz
+	"
+# cargo fetch downloads the crates in prepare().
+options="net"
+
+prepare() {
+	default_prepare
+	# Cargo.toml finds local_agent_rs next to the source tree.
+	mkdir -p "$srcdir"/python-proton-vpn-local-agent
+	ln -sfn "$srcdir"/local-agent-rs-$_localagent/local_agent_rs \
+		"$srcdir"/python-proton-vpn-local-agent/local_agent_rs
+	cargo fetch --target="$CTARGET" --locked
+}
+
+build() {
+	# --target overrides .cargo/config.toml, which asks for a static x86_64-unknown-linux-musl build: a
+	# package links against the system's musl like the rest of Alpine.
+	cargo auditable build --frozen --release --target="$CTARGET"
+}
+
+check() {
+	cargo test --frozen --target="$CTARGET"
+}
+
+package() {
+	install -Dm755 target/"$CTARGET"/release/protontui -t "$pkgdir"/usr/bin/
+	install -Dm755 packaging/openrc/protontui "$pkgdir"/etc/init.d/protontui
+	sed -i 's|/usr/local/bin/protontui|/usr/bin/protontui|' "$pkgdir"/etc/init.d/protontui
+	install -Dm644 README.md TESTING.md -t "$pkgdir"/usr/share/doc/$pkgname/
+}
+
+# protontui's checksum: run `abuild checksum` once v$pkgver is tagged on GitHub.
+sha512sums="
+SKIP  protontui-$pkgver.tar.gz
+18cb8374e04c4769aaae2246e9058aa6487e4be110864a4f2d8a21bbd1e1a4ddd9ad70ff91dbb90a5d9c62693e5cd6afb9147bb621b7f2a8bc6e6c8606c2b9ae  local-agent-rs-$_localagent.tar.gz
+"

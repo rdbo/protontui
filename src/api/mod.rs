@@ -1,14 +1,16 @@
 //! Proton API client: base URL, standard headers, the `{Code, Error, Details}` envelope, token refresh and
 //! retry handling. Endpoint groups live in submodules as `impl ApiClient` blocks.
 
+pub mod alternative;
 pub mod auth;
+pub mod doh;
 pub mod error;
 pub mod servers;
 pub mod vpn;
 
 use std::fmt;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Method, StatusCode};
@@ -20,6 +22,8 @@ use error::*;
 pub use error::{ApiError, HumanVerification};
 
 pub const DEFAULT_BASE_URL: &str = "https://vpn-api.proton.me";
+/// The host of [`DEFAULT_BASE_URL`]; alternative routing (T6.3) only applies to it.
+pub const DEFAULT_API_HOST: &str = "vpn-api.proton.me";
 
 /// `x-pm-appversion`. The client name is our own (`linux-vpn-<type>@<version>`, the format the official Linux
 /// clients use). The version is not protontui's: the API gates on the version number and rejects 0.x with
@@ -84,6 +88,10 @@ struct Inner {
     /// Serializes refreshes: concurrent 401s refresh once.
     refresh_lock: tokio::sync::Mutex<()>,
     listener: RwLock<Option<TokenListener>>,
+    /// The alternative route in use while the API is blocked, and when the direct API was last checked.
+    alternative: RwLock<Option<(alternative::Route, Instant)>>,
+    /// Serializes looking for alternative routes.
+    alternative_lock: tokio::sync::Mutex<()>,
 }
 
 impl ApiClient {
@@ -96,6 +104,8 @@ impl ApiClient {
                 tokens: RwLock::new(None),
                 refresh_lock: tokio::sync::Mutex::new(()),
                 listener: RwLock::new(None),
+                alternative: RwLock::new(None),
+                alternative_lock: tokio::sync::Mutex::new(()),
             }),
         })
     }
@@ -191,6 +201,9 @@ impl ApiClient {
         }
     }
 
+    /// One request, with alternative routing (T6.3): while a route is in use, through it (the direct API is
+    /// checked again every [`alternative::CHECK_INTERVAL`]); otherwise directly, and when that fails as if
+    /// blocked, through the first alternative route that answers.
     async fn send_once(
         &self,
         method: Method,
@@ -199,8 +212,130 @@ impl ApiClient {
         tokens: Option<&Tokens>,
         extra_headers: &[(&str, &str)],
     ) -> Result<RawResponse, ApiError> {
-        let url = format!("{}/{}", self.inner.base_url, path.trim_start_matches('/'));
+        let routable = self.alternative_routing_applies();
+        let active = self.inner.alternative.read().unwrap().clone();
+        if let Some((route, checked_at)) = active.filter(|_| routable) {
+            let stay = checked_at.elapsed() < alternative::CHECK_INTERVAL || !self.direct_api_answers().await;
+            if stay {
+                if checked_at.elapsed() >= alternative::CHECK_INTERVAL {
+                    *self.inner.alternative.write().unwrap() = Some((route.clone(), Instant::now()));
+                }
+                match self
+                    .send_to(&route.http, &route.base_url, method.clone(), path, body, tokens, extra_headers)
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(e) => tracing::warn!("alternative route {} failed: {e}", route.host),
+                }
+            } else {
+                tracing::info!("the API answers directly again; leaving the alternative route {}", route.host);
+            }
+            *self.inner.alternative.write().unwrap() = None;
+        }
+
+        let result = self.send_direct(method.clone(), path, body, tokens, extra_headers).await;
+        let first = match result {
+            Err(ApiError::Network(e)) if routable && alternative::allowed() && alternative::looks_blocked(&e) => e,
+            other => return other,
+        };
+        // As win-app: if the API answers a ping, this was a hiccup; try once more before going around it.
+        let error = if self.direct_api_answers().await {
+            match self.send_direct(method.clone(), path, body, tokens, extra_headers).await {
+                Err(ApiError::Network(e)) if alternative::looks_blocked(&e) => e,
+                other => return other,
+            }
+        } else {
+            first
+        };
+        tracing::warn!("the API looks blocked ({error}); trying alternative routing");
+        match self.send_alternative(method, path, body, tokens, extra_headers).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                tracing::warn!("{e}");
+                Err(ApiError::Network(error))
+            }
+        }
+    }
+
+    /// Alternative routing only makes sense for Proton's own API host (tests talk to local servers).
+    fn alternative_routing_applies(&self) -> bool {
+        self.api_host().is_some_and(|host| host == DEFAULT_API_HOST)
+    }
+
+    fn api_host(&self) -> Option<String> {
+        reqwest::Url::parse(&self.inner.base_url).ok().and_then(|u| u.host_str().map(str::to_owned))
+    }
+
+    /// win-app's `IsApiAvailableAsync`: the API's name resolves and `tests/ping` answers.
+    async fn direct_api_answers(&self) -> bool {
+        let Some(host) = self.api_host() else { return false };
+        let resolves = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host.as_str(), 443)))
+            .await
+            .is_ok_and(|r| r.is_ok_and(|mut addresses| addresses.next().is_some()));
+        if !resolves {
+            return false;
+        }
         let http = self.inner.http.read().unwrap().clone();
+        let url = format!("{}/{}", self.inner.base_url, alternative::PING_PATH);
+        http.get(url).timeout(Duration::from_secs(10)).send().await.is_ok_and(|r| r.status().is_success())
+    }
+
+    async fn send_direct(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        tokens: Option<&Tokens>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<RawResponse, ApiError> {
+        let http = self.inner.http.read().unwrap().clone();
+        self.send_to(&http, &self.inner.base_url, method, path, body, tokens, extra_headers).await
+    }
+
+    /// Finds the alternative routes and sends through the first one that answers like the API (anything but
+    /// a 5xx), which then stays in use.
+    async fn send_alternative(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        tokens: Option<&Tokens>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<RawResponse, ApiError> {
+        let _guard = self.inner.alternative_lock.lock().await;
+        let host = self.api_host().unwrap_or_default();
+        let routes = alternative::discover(&host, tokens.map(|t| t.uid.as_str()), &user_agent()).await?;
+        for route in routes {
+            match self.send_to(&route.http, &route.base_url, method.clone(), path, body, tokens, extra_headers).await {
+                Ok(response) if !response.status.is_server_error() => {
+                    tracing::warn!("the API is blocked; using the alternative route {}", route.host);
+                    *self.inner.alternative.write().unwrap() = Some((route, Instant::now()));
+                    return Ok(response);
+                }
+                Ok(response) => tracing::warn!("alternative route {}: HTTP {}", route.host, response.status),
+                Err(e) => tracing::warn!("alternative route {}: {e}", route.host),
+            }
+        }
+        Err(ApiError::AlternativeRouting("no alternative route answered".into()))
+    }
+
+    /// The alternative host in use, if the API is being reached around a block.
+    pub fn alternative_route(&self) -> Option<String> {
+        self.inner.alternative.read().unwrap().as_ref().map(|(route, _)| route.host.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_to(
+        &self,
+        http: &reqwest::Client,
+        base_url: &str,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        tokens: Option<&Tokens>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<RawResponse, ApiError> {
+        let url = format!("{base_url}/{}", path.trim_start_matches('/'));
         let mut request = http
             .request(method, url)
             .header("x-pm-appversion", APP_VERSION)

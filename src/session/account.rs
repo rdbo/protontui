@@ -92,6 +92,11 @@ impl Session {
 
     /// Cached account info, refreshed when older than [`REFRESH_INTERVAL`]. When the refresh fails (offline),
     /// stale cached info is returned instead.
+    /// The cached account info, whatever its age, without asking the API.
+    pub fn cached_account(&self) -> Option<AccountInfo> {
+        AccountInfo::load(&self.paths.account_file()).ok().flatten()
+    }
+
     pub async fn account(&self) -> Result<AccountInfo> {
         let cached = AccountInfo::load(&self.paths.account_file())?;
         match cached {

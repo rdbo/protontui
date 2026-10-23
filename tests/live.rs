@@ -197,3 +197,39 @@ async fn live_certificate() {
     assert!(cert.certificate.starts_with("-----BEGIN CERTIFICATE-----"));
     assert!(cert.refresh_time > now && cert.expiration_time > cert.refresh_time);
 }
+
+/// T6.3: the DoH TXT records list alternative hosts for the API, and they answer with a pinned certificate.
+#[tokio::test]
+async fn alternative_routes_answer() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    let routes =
+        protontui::api::alternative::discover(protontui::api::DEFAULT_API_HOST, None, "protontui-test").await.unwrap();
+    assert!(!routes.is_empty());
+    let route = &routes[0];
+    let reply: serde_json::Value =
+        route.http.get(format!("{}/tests/ping", route.base_url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(reply["Code"], 1000, "{reply}");
+    eprintln!("{} routes, first {} answers tests/ping", routes.len(), route.host);
+}
+
+/// T6.3 end to end: with the API "blocked" (a port where nothing answers), requests go around it.
+#[tokio::test]
+async fn blocked_api_goes_around() {
+    if !live() {
+        eprintln!("skipped: set PROTONTUI_LIVE=1");
+        return;
+    }
+    let blocked = format!("https://{}:9", protontui::api::DEFAULT_API_HOST);
+    let api = ApiClient::new(&blocked).unwrap();
+    let config = api.client_config().await.unwrap();
+    assert!(!config.default_ports.wireguard.udp.is_empty());
+    let route = api.alternative_route().expect("an alternative route is in use");
+    eprintln!("clientconfig through the alternative route {route}");
+    // The route stays in use for the next request.
+    let session = api.create_unauth_session().await.unwrap();
+    assert!(!session.uid.is_empty());
+    assert_eq!(api.alternative_route(), Some(route));
+}

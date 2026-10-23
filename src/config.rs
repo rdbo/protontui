@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::servers::select::FeatureFilter;
+
 /// Overrides the state directory, for development and tests.
 pub const STATE_DIR_ENV: &str = "PROTONTUI_STATE_DIR";
 /// Where the root daemon keeps sessions, keys, certificates and settings.
@@ -171,10 +173,14 @@ pub struct Settings {
     pub port_forwarding: bool,
     pub ipv6: bool,
     pub custom_dns: CustomDns,
+    /// Reach the API through alternative routes when it's blocked (T6.3).
+    pub alternative_routing: bool,
     pub auto_connect: AutoConnect,
-    pub favourites: Vec<ConnectTarget>,
+    pub favourites: Vec<Destination>,
     /// Most recent first.
-    pub recents: Vec<ConnectTarget>,
+    pub recents: Vec<Destination>,
+    /// Named connections (T6.2).
+    pub profiles: Vec<Profile>,
 }
 
 impl Default for Settings {
@@ -189,9 +195,11 @@ impl Default for Settings {
             port_forwarding: false,
             ipv6: true,
             custom_dns: CustomDns::default(),
+            alternative_routing: true,
             auto_connect: AutoConnect::Off,
             favourites: Vec::new(),
             recents: Vec::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -247,14 +255,123 @@ pub enum AutoConnect {
     Profile(String),
 }
 
-/// Something the user can connect to; used by favourites, recents and auto-connect.
+/// Something the user can connect to; used by favourites, recents, profiles and auto-connect.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ConnectTarget {
     Fastest,
-    Country { code: String },
-    City { country: String, city: String },
-    Server { name: String },
+    Country {
+        code: String,
+    },
+    City {
+        country: String,
+        city: String,
+    },
+    Server {
+        name: String,
+    },
+    /// Secure Core into `exit` through `entry`; either may be left to the fastest choice.
+    #[serde(rename = "secure-core")]
+    SecureCore {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<String>,
+    },
+    /// A [`Profile`], by name.
+    Profile {
+        name: String,
+    },
+}
+
+/// A target plus the server feature it asked for (the P2P and Tor tabs, `--feature`): what favourites and
+/// recents remember. Older settings files hold bare targets, which read as having no feature.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Destination {
+    #[serde(flatten)]
+    pub target: ConnectTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature: Option<FeatureFilter>,
+}
+
+impl From<ConnectTarget> for Destination {
+    fn from(target: ConnectTarget) -> Self {
+        Self { target, feature: None }
+    }
+}
+
+/// A named connection (T6.2): where to, and the connection features that override the global settings
+/// while it's connected. Unset fields follow the global settings. The protocol is always WireGuard over UDP
+/// (PLAN.md §1), so what a profile can pick there is the port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Profile {
+    pub name: String,
+    /// Never a profile itself.
+    pub target: Destination,
+    /// WireGuard UDP port (normally one of clientconfig's: 443, 88, 1224, 51820, 500, 4500); unset tries
+    /// them in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netshield: Option<NetShield>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn_accelerator: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderate_nat: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_forwarding: Option<bool>,
+}
+
+/// Longest profile name.
+pub const MAX_PROFILE_NAME: usize = 64;
+
+impl Profile {
+    /// A profile for `target` that overrides nothing.
+    pub fn new(name: impl Into<String>, target: Destination) -> Self {
+        Self {
+            name: name.into(),
+            target,
+            port: None,
+            netshield: None,
+            vpn_accelerator: None,
+            moderate_nat: None,
+            port_forwarding: None,
+        }
+    }
+
+    /// Checks the name (1–64 printable characters, no surrounding spaces) and that the target isn't a profile.
+    pub fn validate(&self) -> Result<()> {
+        let name = &self.name;
+        anyhow::ensure!(!name.trim().is_empty(), "a profile needs a name");
+        anyhow::ensure!(name.trim() == name, "a profile name can't start or end with spaces");
+        anyhow::ensure!(
+            name.chars().count() <= MAX_PROFILE_NAME,
+            "profile names are at most {MAX_PROFILE_NAME} characters"
+        );
+        anyhow::ensure!(!name.chars().any(char::is_control), "a profile name can't contain control characters");
+        anyhow::ensure!(
+            !matches!(self.target.target, ConnectTarget::Profile { .. }),
+            "a profile can't point at another profile"
+        );
+        anyhow::ensure!(self.port != Some(0), "port 0 isn't a port");
+        Ok(())
+    }
+
+    /// The settings a connection with this profile runs with: `settings` with this profile's overrides.
+    pub fn apply(&self, settings: &mut Settings) {
+        if let Some(level) = self.netshield {
+            settings.netshield = Some(level);
+        }
+        if let Some(on) = self.vpn_accelerator {
+            settings.vpn_accelerator = on;
+        }
+        if let Some(on) = self.moderate_nat {
+            settings.moderate_nat = on;
+        }
+        if let Some(on) = self.port_forwarding {
+            settings.port_forwarding = on;
+        }
+    }
 }
 
 impl Settings {
@@ -282,6 +399,10 @@ impl Settings {
         write_atomic(path, text.as_bytes(), 0o644).with_context(|| format!("writing {}", path.display()))
     }
 
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
+    }
+
     /// The NetShield level to use: the explicit setting, else the tier default.
     pub fn netshield_for_tier(&self, tier: u8) -> NetShield {
         self.netshield.unwrap_or(if tier < 1 { NetShield::Off } else { NetShield::Malware })
@@ -305,14 +426,27 @@ mod tests {
                 enabled: true,
                 servers: vec!["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()],
             },
+            alternative_routing: false,
             auto_connect: AutoConnect::Profile("work".into()),
             favourites: vec![
-                ConnectTarget::Country { code: "CH".into() },
-                ConnectTarget::Server { name: "CH#10".into() },
+                ConnectTarget::Country { code: "CH".into() }.into(),
+                Destination { target: ConnectTarget::Country { code: "SE".into() }, feature: Some(FeatureFilter::P2P) },
+                ConnectTarget::Server { name: "CH#10".into() }.into(),
             ],
             recents: vec![
-                ConnectTarget::City { country: "US".into(), city: "New York".into() },
-                ConnectTarget::Fastest,
+                ConnectTarget::City { country: "US".into(), city: "New York".into() }.into(),
+                ConnectTarget::SecureCore { exit: Some("DE".into()), entry: None }.into(),
+                ConnectTarget::Profile { name: "work".into() }.into(),
+                ConnectTarget::Fastest.into(),
+            ],
+            profiles: vec![
+                Profile {
+                    port: Some(443),
+                    netshield: Some(NetShield::Off),
+                    port_forwarding: Some(true),
+                    ..Profile::new("work", ConnectTarget::Country { code: "CH".into() }.into())
+                },
+                Profile::new("tor", Destination { target: ConnectTarget::Fastest, feature: Some(FeatureFilter::Tor) }),
             ],
         }
     }
@@ -367,6 +501,42 @@ mod tests {
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
         assert!(!path.exists());
         assert!(dir.path().join("settings.toml.bad").exists());
+    }
+
+    #[test]
+    fn older_favourites_and_recents_still_load() {
+        let old = r#"
+            [[favourites]]
+            kind = "country"
+            code = "CH"
+
+            [[recents]]
+            kind = "fastest"
+        "#;
+        let settings: Settings = toml::from_str(old).unwrap();
+        assert_eq!(settings.favourites, [Destination::from(ConnectTarget::Country { code: "CH".into() })]);
+        assert_eq!(settings.recents, [Destination::from(ConnectTarget::Fastest)]);
+    }
+
+    #[test]
+    fn profiles_override_connection_features() {
+        let profile = Profile {
+            netshield: Some(NetShield::AdsTrackersMalware),
+            vpn_accelerator: Some(false),
+            ..Profile::new("p", ConnectTarget::Fastest.into())
+        };
+        let mut settings = Settings { moderate_nat: true, ..Settings::default() };
+        profile.apply(&mut settings);
+        assert_eq!(settings.netshield, Some(NetShield::AdsTrackersMalware));
+        assert!(!settings.vpn_accelerator);
+        assert!(settings.moderate_nat, "unset in the profile: the global value stays");
+
+        assert!(profile.validate().is_ok());
+        for bad in ["", " x", "x\n"] {
+            assert!(Profile { name: bad.into(), ..profile.clone() }.validate().is_err(), "{bad:?}");
+        }
+        let nested = Profile::new("n", ConnectTarget::Profile { name: "p".into() }.into());
+        assert!(nested.validate().is_err());
     }
 
     #[test]
